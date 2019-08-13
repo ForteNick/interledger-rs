@@ -1,12 +1,16 @@
 use futures::{future::err, Future};
 use hex;
-use interledger_packet::{ErrorCode, RejectBuilder};
-use interledger_service::*;
+use interledger_packet::{Address, ErrorCode, RejectBuilder};
+use interledger_service::{
+    Account, BoxedIlpFuture, IncomingRequest, IncomingService, OutgoingRequest, OutgoingService,
+};
 use log::error;
 use ring::digest::{digest, SHA256};
 use std::marker::PhantomData;
 use std::time::{Duration, SystemTime};
 use tokio::prelude::FutureExt;
+
+const DEFAULT_MAXIMUM_EXPIRY_DURATION: u64 = 60000; // seconds
 
 /// # Validator Service
 ///
@@ -16,8 +20,10 @@ use tokio::prelude::FutureExt;
 ///
 #[derive(Clone)]
 pub struct ValidatorService<IO, A> {
+    ilp_address: Address,
     next: IO,
     account_type: PhantomData<A>,
+    maximum_expiry_duration: u64,
 }
 
 impl<I, A> ValidatorService<I, A>
@@ -25,11 +31,18 @@ where
     I: IncomingService<A>,
     A: Account,
 {
-    pub fn incoming(next: I) -> Self {
+    pub fn incoming(ilp_address: Address, next: I) -> Self {
         ValidatorService {
+            ilp_address,
             next,
             account_type: PhantomData,
+            maximum_expiry_duration: DEFAULT_MAXIMUM_EXPIRY_DURATION,
         }
+    }
+
+    pub fn set_max_expiry_duration(&mut self, millis: u64) -> &mut Self {
+        self.maximum_expiry_duration = millis;
+        self
     }
 }
 
@@ -38,10 +51,12 @@ where
     O: OutgoingService<A>,
     A: Account,
 {
-    pub fn outgoing(next: O) -> Self {
+    pub fn outgoing(ilp_address: Address, next: O) -> Self {
         ValidatorService {
+            ilp_address,
             next,
             account_type: PhantomData,
+            maximum_expiry_duration: DEFAULT_MAXIMUM_EXPIRY_DURATION,
         }
     }
 }
@@ -56,9 +71,8 @@ where
     /// On receiving a request:
     /// 1. If the prepare packet in the request is not expired, forward it, otherwise return a reject
     fn handle_request(&mut self, request: IncomingRequest<A>) -> Self::Future {
-        if request.prepare.expires_at() >= SystemTime::now() {
-            Box::new(self.next.handle_request(request))
-        } else {
+        let now = SystemTime::now();
+        if request.prepare.expires_at() < now {
             error!(
                 "Incoming packet expired {}ms ago at {:?} (time now: {:?})",
                 SystemTime::now()
@@ -66,16 +80,33 @@ where
                     .unwrap_or_else(|_| Duration::from_secs(0))
                     .as_millis(),
                 request.prepare.expires_at(),
-                SystemTime::now()
+                now
             );
             let result = Box::new(err(RejectBuilder {
                 code: ErrorCode::R00_TRANSFER_TIMED_OUT,
                 message: &[],
-                triggered_by: None,
+                triggered_by: Some(&self.ilp_address),
                 data: &[],
             }
             .build()));
             Box::new(result)
+        } else if now + Duration::from_millis(self.maximum_expiry_duration)
+            < request.prepare.expires_at()
+        {
+            error!("Incoming packet's expiry is too long in the future (it would place funds on hold for too long). Packet expires in {}ms, maximum is {}",
+            request.prepare.expires_at().duration_since(now).unwrap_or_else(|_| Duration::from_secs(0)).as_millis(), self.maximum_expiry_duration);
+            let result = Box::new(err(RejectBuilder {
+                // TODO should this be a different error code?
+                // We don't currently have one specifically for this case
+                code: ErrorCode::F00_BAD_REQUEST,
+                message: b"Packet expires too far in the future",
+                triggered_by: Some(&self.ilp_address),
+                data: &[],
+            }
+            .build()));
+            Box::new(result)
+        } else {
+            Box::new(self.next.handle_request(request))
         }
     }
 }
@@ -98,6 +129,8 @@ where
     fn send_request(&mut self, request: OutgoingRequest<A>) -> Self::Future {
         let mut condition: [u8; 32] = [0; 32];
         condition[..].copy_from_slice(request.prepare.execution_condition()); // why?
+        let ilp_address = self.ilp_address.clone();
+        let ilp_address_clone = ilp_address.clone();
 
         if let Ok(time_left) = request
             .prepare
@@ -120,7 +153,7 @@ where
                             RejectBuilder {
                                 code: ErrorCode::R00_TRANSFER_TIMED_OUT,
                                 message: &[],
-                                triggered_by: None,
+                                triggered_by: Some(&ilp_address),
                                 data: &[],
                             }
                             .build()
@@ -135,7 +168,7 @@ where
                             Err(RejectBuilder {
                                 code: ErrorCode::F09_INVALID_PEER_RESPONSE,
                                 message: b"Fulfillment did not match condition",
-                                triggered_by: None,
+                                triggered_by: Some(&ilp_address_clone),
                                 data: &[],
                             }
                             .build())
@@ -154,7 +187,7 @@ where
             Box::new(err(RejectBuilder {
                 code: ErrorCode::R00_TRANSFER_TIMED_OUT,
                 message: &[],
-                triggered_by: None,
+                triggered_by: Some(&ilp_address),
                 data: &[],
             }
             .build()))
@@ -189,14 +222,17 @@ mod incoming {
     fn lets_through_valid_incoming_packet() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let requests_clone = requests.clone();
-        let mut validator = ValidatorService::incoming(incoming_service_fn(move |request| {
-            requests_clone.lock().unwrap().push(request);
-            Ok(FulfillBuilder {
-                fulfillment: &[0; 32],
-                data: b"test data",
-            }
-            .build())
-        }));
+        let mut validator = ValidatorService::incoming(
+            Address::from_str("example.connector").unwrap(),
+            incoming_service_fn(move |request| {
+                requests_clone.lock().unwrap().push(request);
+                Ok(FulfillBuilder {
+                    fulfillment: &[0; 32],
+                    data: b"test data",
+                }
+                .build())
+            }),
+        );
         let result = validator
             .handle_request(IncomingRequest {
                 from: TestAccount(0),
@@ -222,14 +258,17 @@ mod incoming {
     fn rejects_expired_incoming_packet() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let requests_clone = requests.clone();
-        let mut validator = ValidatorService::incoming(incoming_service_fn(move |request| {
-            requests_clone.lock().unwrap().push(request);
-            Ok(FulfillBuilder {
-                fulfillment: &[0; 32],
-                data: b"test data",
-            }
-            .build())
-        }));
+        let mut validator = ValidatorService::incoming(
+            Address::from_str("example.connector").unwrap(),
+            incoming_service_fn(move |request| {
+                requests_clone.lock().unwrap().push(request);
+                Ok(FulfillBuilder {
+                    fulfillment: &[0; 32],
+                    data: b"test data",
+                }
+                .build())
+            }),
+        );
         let result = validator
             .handle_request(IncomingRequest {
                 from: TestAccount(0),
@@ -254,12 +293,50 @@ mod incoming {
             ErrorCode::R00_TRANSFER_TIMED_OUT
         );
     }
+
+    #[test]
+    fn rejects_packet_with_too_long_expiry() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = requests.clone();
+        let mut validator = ValidatorService::incoming(
+            Address::from_str("example.connector").unwrap(),
+            incoming_service_fn(move |request| {
+                requests_clone.lock().unwrap().push(request);
+                Ok(FulfillBuilder {
+                    fulfillment: &[0; 32],
+                    data: b"test data",
+                }
+                .build())
+            }),
+        );
+        let result = validator
+            .handle_request(IncomingRequest {
+                from: TestAccount(0),
+                prepare: PrepareBuilder {
+                    destination: Address::from_str("example.destination").unwrap(),
+                    amount: 100,
+                    expires_at: SystemTime::now() + Duration::from_secs(61),
+                    execution_condition: &[
+                        102, 104, 122, 173, 248, 98, 189, 119, 108, 143, 193, 139, 142, 159, 142,
+                        32, 8, 151, 20, 133, 110, 226, 51, 179, 144, 42, 89, 29, 13, 95, 41, 37,
+                    ],
+                    data: b"test data",
+                }
+                .build(),
+            })
+            .wait();
+
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), ErrorCode::F00_BAD_REQUEST);
+    }
 }
 
 #[cfg(test)]
 mod outgoing {
     use super::*;
     use interledger_packet::*;
+    use interledger_service::outgoing_service_fn;
     use std::str::FromStr;
     use std::{
         sync::{Arc, Mutex},
@@ -270,14 +347,17 @@ mod outgoing {
     fn lets_through_valid_outgoing_response() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let requests_clone = requests.clone();
-        let mut validator = ValidatorService::outgoing(outgoing_service_fn(move |request| {
-            requests_clone.lock().unwrap().push(request);
-            Ok(FulfillBuilder {
-                fulfillment: &[0; 32],
-                data: b"test data",
-            }
-            .build())
-        }));
+        let mut validator = ValidatorService::outgoing(
+            Address::from_str("example.connector").unwrap(),
+            outgoing_service_fn(move |request| {
+                requests_clone.lock().unwrap().push(request);
+                Ok(FulfillBuilder {
+                    fulfillment: &[0; 32],
+                    data: b"test data",
+                }
+                .build())
+            }),
+        );
         let result = validator
             .send_request(OutgoingRequest {
                 from: TestAccount(1),
@@ -305,14 +385,17 @@ mod outgoing {
     fn returns_reject_instead_of_invalid_fulfillment() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let requests_clone = requests.clone();
-        let mut validator = ValidatorService::outgoing(outgoing_service_fn(move |request| {
-            requests_clone.lock().unwrap().push(request);
-            Ok(FulfillBuilder {
-                fulfillment: &[1; 32],
-                data: b"test data",
-            }
-            .build())
-        }));
+        let mut validator = ValidatorService::outgoing(
+            Address::from_str("example.connector").unwrap(),
+            outgoing_service_fn(move |request| {
+                requests_clone.lock().unwrap().push(request);
+                Ok(FulfillBuilder {
+                    fulfillment: &[1; 32],
+                    data: b"test data",
+                }
+                .build())
+            }),
+        );
         let result = validator
             .send_request(OutgoingRequest {
                 from: TestAccount(1),

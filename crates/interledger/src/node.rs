@@ -172,7 +172,7 @@ impl InterledgerNode {
                                     // service to others like the router and then call handle_incoming on it to set up the incoming handler
                                     let outgoing_service = btp_server_service.clone();
                                     let outgoing_service =
-                                        ValidatorService::outgoing(outgoing_service);
+                                        ValidatorService::outgoing(ilp_address.clone(), outgoing_service);
                                     let outgoing_service = HttpClientService::new(store.clone(), outgoing_service);
 
                                     // Note: the expiry shortener must come after the Validator so that the expiry duration
@@ -214,7 +214,7 @@ impl InterledgerNode {
                                     let incoming_service =
                                         MaxPacketAmountService::new(incoming_service);
                                     let incoming_service =
-                                        ValidatorService::incoming(incoming_service);
+                                        ValidatorService::incoming(ilp_address.clone(), incoming_service);
                                     let incoming_service = RateLimitService::new(
                                         ilp_address.clone(),
                                         store.clone(),

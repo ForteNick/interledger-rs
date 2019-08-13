@@ -21,7 +21,7 @@ use log::debug;
 use parking_lot::RwLock;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::str::FromStr;
-use std::{convert::TryFrom, net::SocketAddr, str, sync::Arc, u64};
+use std::{net::SocketAddr, str, sync::Arc, u64};
 use url::Url;
 
 lazy_static! {
@@ -90,7 +90,7 @@ pub fn send_spsp_payment_btp(
         // TODO seems kind of janky to clone the btp_service just to
         // close it later. Is there some better way of making sure it closes?
         let btp_service = service.clone();
-        let service = ValidatorService::outgoing(service);
+        let service = ValidatorService::outgoing(LOCAL_ILP_ADDRESS.clone(), service);
         let store = InMemoryStore::from_accounts(vec![account.clone()]);
         let router = Router::new(store, service);
         pay(router, account, &receiver, amount)
@@ -145,7 +145,7 @@ pub fn send_spsp_payment_http(
             .build())
         }),
     );
-    let service = ValidatorService::outgoing(service);
+    let service = ValidatorService::outgoing(LOCAL_ILP_ADDRESS.clone(), service);
     let service = Router::new(store, service);
     pay(service, account, &receiver, amount)
         .map_err(|err| {
@@ -170,7 +170,8 @@ pub fn run_spsp_server_btp(
     quiet: bool,
 ) -> impl Future<Item = (), Error = ()> {
     debug!("Starting SPSP server");
-    let ilp_address = Arc::new(RwLock::new(Bytes::new()));
+    let ilp_address: Arc<RwLock<Address>> = Arc::new(RwLock::new(LOCAL_ILP_ADDRESS.clone()));
+    let ilp_address_clone = ilp_address.clone();
     let btp_server = parse_btp_url(btp_server).unwrap();
     let incoming_account: Account = AccountBuilder::new(LOCAL_ILP_ADDRESS.clone())
         .additional_routes(&[b"peer."])
@@ -180,8 +181,6 @@ pub fn run_spsp_server_btp(
     let server_secret = Bytes::from(&random_secret()[..]);
     let store = InMemoryStore::from_accounts(vec![incoming_account.clone()]);
 
-    // Can we get better syntax than .read()[..] here? Doesn't seem too intuitive.
-    let ilp_addr = Address::try_from(&ilp_address.read()[..]).ok();
     connect_client(
         vec![incoming_account.clone()],
         true,
@@ -190,7 +189,7 @@ pub fn run_spsp_server_btp(
                 code: ErrorCode::F02_UNREACHABLE,
                 message: &format!("No outgoing route for: {:?}", request.from.client_address(),)
                     .as_bytes(),
-                triggered_by: ilp_addr.as_ref(),
+                triggered_by: Some(&ilp_address_clone.read()),
                 data: &[],
             }
             .build())
@@ -201,10 +200,12 @@ pub fn run_spsp_server_btp(
         eprintln!("(Hint: is moneyd running?)");
     })
     .and_then(move |btp_service| {
-        let outgoing_service = ValidatorService::outgoing(btp_service.clone());
+        let outgoing_service =
+            ValidatorService::outgoing(ilp_address.read().clone(), btp_service.clone());
         let outgoing_service = StreamReceiverService::new(server_secret.clone(), outgoing_service);
         let incoming_service = Router::new(store.clone(), outgoing_service);
-        let mut incoming_service = ValidatorService::incoming(incoming_service);
+        let mut incoming_service =
+            ValidatorService::incoming(ilp_address.read().clone(), incoming_service);
 
         btp_service.handle_incoming(incoming_service.clone());
 
@@ -212,7 +213,7 @@ pub fn run_spsp_server_btp(
             debug!("SPSP server got ILDCP info: {:?}", info);
             let client_address = info.client_address();
             // Update the ILP Address with the ildcp info request's address
-            *ilp_address.write() = client_address.to_bytes();
+            *ilp_address.write() = client_address.clone();
 
             let receiver_account = AccountBuilder::new(client_address.clone())
                 .asset_code(String::from_utf8(info.asset_code().to_vec()).unwrap_or_default())
@@ -245,6 +246,7 @@ pub fn run_spsp_server_http(
     quiet: bool,
 ) -> impl Future<Item = (), Error = ()> {
     let ilp_address = ildcp_info.client_address();
+    let ilp_address_clone = ilp_address.clone();
     if !quiet {
         println!("Creating SPSP server. ILP Address: {}", ilp_address)
     }
@@ -265,7 +267,7 @@ pub fn run_spsp_server_http(
                     request.prepare.destination(),
                 )
                 .as_bytes(),
-                triggered_by: Some(&ilp_address),
+                triggered_by: Some(&ilp_address_clone),
                 data: &[],
             }
             .build())
@@ -273,7 +275,7 @@ pub fn run_spsp_server_http(
     );
     let incoming_handler = Router::new(store.clone(), outgoing_handler);
     let incoming_handler = IldcpService::new(incoming_handler);
-    let incoming_handler = ValidatorService::incoming(incoming_handler);
+    let incoming_handler = ValidatorService::incoming(ilp_address.clone(), incoming_handler);
     let http_service = HttpServerService::new(incoming_handler, store);
 
     if !quiet {
@@ -316,6 +318,7 @@ pub fn run_moneyd_local(
     ildcp_info: IldcpResponse,
 ) -> impl Future<Item = (), Error = ()> {
     let ilp_address = ildcp_info.client_address();
+    let ilp_address_clone = ilp_address.clone();
     let store = InMemoryStore::default();
     // TODO this needs a reference to the BtpService so it can send outgoing packets
     println!("Listening on: {}", address);
@@ -332,7 +335,7 @@ pub fn run_moneyd_local(
         move |btp_service| {
             let service = Router::new(store, btp_service.clone());
             let service = IldcpService::new(service);
-            let service = ValidatorService::incoming(service);
+            let service = ValidatorService::incoming(ilp_address_clone, service);
             btp_service.handle_incoming(service);
             Ok(())
         },
