@@ -34,6 +34,8 @@ ildcp = ["interledger-ildcp"]
 spsp = ["interledger-spsp", "stream"]
 stream = ["interledger-stream", "ildcp"]
 settlement = ["interledger-settlement"]
+router = ["interledger-router"]
+service-util = ["interledger-service-util"]
 
 [dependencies]
 base64 = "0.10.1"
