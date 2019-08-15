@@ -33,6 +33,7 @@ store-memory = ["interledger-store-memory"]
 ildcp = ["interledger-ildcp"]
 spsp = ["interledger-spsp", "stream"]
 stream = ["interledger-stream", "ildcp"]
+settlement = ["interledger-settlement"]
 
 [dependencies]
 base64 = "0.10.1"

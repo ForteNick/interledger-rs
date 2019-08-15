@@ -128,3 +128,8 @@ pub mod spsp {
 pub mod service_util {
     pub use interledger_service_util::*;
 }
+
+#[cfg(feature = "settlement")]
+pub mod settlement {
+    pub use interledger_settlement::*;
+}
