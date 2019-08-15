@@ -91,7 +91,7 @@ mod tests {
                 prepare: PrepareBuilder {
                     destination: ILDCP_DESTINATION.clone(),
                     amount: 100,
-                    execution_condition: &PEER_PROTOCOL_CONDITION.clone(),
+                    execution_condition: &PEER_PROTOCOL_CONDITION,
                     expires_at: SystemTime::UNIX_EPOCH,
                     data: &[],
                 }
@@ -116,7 +116,7 @@ mod tests {
                 prepare: PrepareBuilder {
                     destination: ILDCP_DESTINATION.clone(),
                     amount: 100,
-                    execution_condition: &PEER_PROTOCOL_CONDITION.clone(),
+                    execution_condition: &PEER_PROTOCOL_CONDITION,
                     expires_at: SystemTime::UNIX_EPOCH,
                     data: &[],
                 }
