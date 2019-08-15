@@ -102,7 +102,7 @@ impl<'a, S, Si, A> EthereumLedgerSettlementEngineBuilder<'a, S, Si, A>
 where
     S: EthereumStore<Account = A> + Clone + Send + Sync + 'static,
     Si: EthereumLedgerTxSigner + Clone + Send + Sync + 'static,
-    A: EthereumAccount + Send + Sync + 'static,
+    A: EthereumAccount + Clone + Send + Sync + 'static,
 {
     pub fn new(store: S, signer: Si) -> Self {
         Self {
@@ -224,7 +224,7 @@ impl<S, Si, A> EthereumLedgerSettlementEngine<S, Si, A>
 where
     S: EthereumStore<Account = A> + Clone + Send + Sync + 'static,
     Si: EthereumLedgerTxSigner + Clone + Send + Sync + 'static,
-    A: EthereumAccount + Send + Sync + 'static,
+    A: EthereumAccount + Clone + Send + Sync + 'static,
 {
     /// Periodically spawns a job every `self.poll_frequency` that notifies the
     /// Settlement Engine's connectors about transactions which are sent to the
@@ -613,7 +613,7 @@ impl<S, Si, A> SettlementEngine for EthereumLedgerSettlementEngine<S, Si, A>
 where
     S: EthereumStore<Account = A> + Clone + Send + Sync + 'static,
     Si: EthereumLedgerTxSigner + Clone + Send + Sync + 'static,
-    A: EthereumAccount + Send + Sync + 'static,
+    A: EthereumAccount + Clone + Send + Sync + 'static,
 {
     /// Settlement Engine's function that corresponds to the
     /// /accounts/:id/ endpoint (POST). It queries the connector's
