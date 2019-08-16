@@ -26,10 +26,12 @@ cli = [
     "interledger-store-redis",
     "interledger-api",
 ]
+api = ["interledger-api"]
 btp = ["interledger-btp"]
 ccp = ["interledger-ccp"]
 http = ["interledger-http"]
 store-memory = ["interledger-store-memory"]
+store-redis = ["interledger-store-redis"]
 ildcp = ["interledger-ildcp"]
 spsp = ["interledger-spsp", "stream"]
 stream = ["interledger-stream", "ildcp"]

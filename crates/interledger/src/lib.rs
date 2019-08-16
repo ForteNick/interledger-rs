@@ -81,6 +81,19 @@ pub mod store_memory {
     pub use interledger_store_memory::*;
 }
 
+#[cfg(feature = "store-redis")]
+pub mod store_redis {
+    //! # interledger-store-redis
+    //!
+    //! A simple redis server store for persisting account details.
+    pub use interledger_store_redis::*;
+}
+
+#[cfg(feature = "api")]
+pub mod api {
+    pub use interledger_api::*;
+}
+
 /// Interledger Dynamic Configuration Protocol (ILDCP)
 #[cfg(feature = "ildcp")]
 pub mod ildcp {
