@@ -126,10 +126,25 @@ pub mod spsp {
 /// Miscellaneous services
 #[cfg(feature = "service-util")]
 pub mod service_util {
+    //! # interledger-service-util
+    //!
+    //! Implementations of miscellaneous utility services.
     pub use interledger_service_util::*;
 }
 
 #[cfg(feature = "settlement")]
 pub mod settlement {
+    //! # interledger-settlement
+    //!
+    //! Implements the settlement business logic
     pub use interledger_settlement::*;
+}
+
+#[cfg(feature = "settlement-engines")]
+pub mod settlement_engines {
+    //! # interledger-settlement-engines
+    //!
+    //! Service to expose the Settlement API via HTTPS. Provides an interface for plugging in arbitrary settlement
+    //! engines.
+    pub use interledger_settlement_engines::*;
 }
