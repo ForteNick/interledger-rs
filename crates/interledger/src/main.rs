@@ -2,6 +2,7 @@ use base64;
 use clap::value_t;
 use clap::{App, Arg, ArgGroup, SubCommand};
 use config;
+use futures::future::Future;
 use hex;
 use interledger::{cli::*, node::*};
 use interledger_ildcp::IldcpResponseBuilder;
@@ -326,7 +327,7 @@ pub fn main() {
                         send_routes: matches.is_present("send_routes"),
                         receive_routes: matches.is_present("receive_routes"),
                         routing_relation: value_t!(matches, "routing_relation", String).ok(),
-                        round_trip_time: value_t!(matches, "round_trip_time", u64).ok(),
+                        round_trip_time: value_t!(matches, "round_trip_time", u32).ok(),
                         packets_per_minute_limit: value_t!(
                             matches,
                             "packets_per_minute_limit",
@@ -337,7 +338,10 @@ pub fn main() {
                             .ok(),
                         settlement_engine_url: None,
                     };
-                    tokio::run(insert_account_redis(redis_uri, &server_secret, account));
+                    tokio::run(
+                        insert_account_redis(redis_uri, &server_secret, account)
+                            .and_then(move |_| Ok(())),
+                    );
                 }
                 _ => app.print_help().unwrap(),
             },
