@@ -8,4 +8,4 @@ Kind of backwards.
 
 ## Develop Branch
 
-**develop** is a branch off **master** which is in sync with Forte code and therefore what we build against.
+**develop** is a branch off **master** which is in sync with Forte code and therefore what we should always build against.
