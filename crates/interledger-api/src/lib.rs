@@ -8,7 +8,7 @@ use interledger_http::{HttpAccount, HttpStore};
 use interledger_ildcp::IldcpAccount;
 use interledger_packet::Address;
 use interledger_router::RouterStore;
-use interledger_service::{Account as AccountTrait, IncomingService};
+use interledger_service::{Account as AccountTrait, IncomingService, Username};
 use interledger_service_util::{BalanceStore, ExchangeRateStore};
 use interledger_settlement::{SettlementAccount, SettlementStore};
 use serde::Serialize;
@@ -61,6 +61,7 @@ pub trait NodeStore: Clone + Send + Sync + 'static {
 #[derive(Debug, Extract, Response, Clone)]
 pub struct AccountDetails {
     pub ilp_address: Address,
+    pub username: Username,
     pub asset_code: String,
     pub asset_scale: u8,
     #[serde(default = "u64::max_value")]
@@ -87,7 +88,7 @@ pub struct AccountDetails {
 pub struct NodeApi<S, I> {
     store: S,
     admin_api_token: String,
-    default_spsp_account: Option<String>,
+    default_spsp_account: Option<Username>,
     incoming_handler: I,
     server_secret: Bytes,
 }
@@ -125,8 +126,8 @@ where
         }
     }
 
-    pub fn default_spsp_account(&mut self, account_id: String) -> &mut Self {
-        self.default_spsp_account = Some(account_id);
+    pub fn default_spsp_account(&mut self, username: Username) -> &mut Self {
+        self.default_spsp_account = Some(username);
         self
     }
 
@@ -146,8 +147,8 @@ where
                     self.store.clone(),
                     self.incoming_handler.clone(),
                 );
-                if let Some(account_id) = &self.default_spsp_account {
-                    spsp.default_spsp_account(account_id.clone());
+                if let Some(username) = &self.default_spsp_account {
+                    spsp.default_spsp_account(username.clone());
                 }
                 spsp
             })

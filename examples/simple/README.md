@@ -7,7 +7,7 @@ This example sets up two local Interledger.rs nodes, peers them together, and se
 
 To run the full example, you can use [`run-md.sh`](../../scripts/run-md.sh) as described [here](../README.md). Otherwise, you can walk through each step below.
 
-Each of the services write their logs to files found under the `logs` directory. You can run `tail -f logs/node-a.log`, for example, to watch the logs of Node A.
+Each of the services write their logs to files found under the `logs` directory. You can run `tail -f logs/node_a.log`, for example, to watch the logs of Node A.
 
 ![overview](images/overview.svg)
 
@@ -88,7 +88,7 @@ export RUST_LOG=interledger=debug
 # Start both nodes
 # Note that the configuration options can be passed as environment variables
 # or saved to a YAML file and passed to the node with the `--config` or `-c` CLI argument
-ILP_ADDRESS=example.node-a \
+ILP_ADDRESS=example.node_a \
 ILP_SECRET_SEED=8852500887504328225458511465394229327394647958135038836332350604 \
 ILP_ADMIN_AUTH_TOKEN=admin-a \
 ILP_REDIS_CONNECTION=redis://127.0.0.1:6379/0 \
@@ -96,9 +96,9 @@ ILP_HTTP_ADDRESS=127.0.0.1:7770 \
 ILP_BTP_ADDRESS=127.0.0.1:7768 \
 ILP_SETTLEMENT_ADDRESS=127.0.0.1:7771 \
 ILP_DEFAULT_SPSP_ACCOUNT=0 \
-cargo run --package interledger -- node &> logs/node-a.log &
+cargo run --package interledger -- node &> logs/node_a.log &
 
-ILP_ADDRESS=example.node-b \
+ILP_ADDRESS=example.node_b \
 ILP_SECRET_SEED=1604966725982139900555208458637022875563691455429373719368053354 \
 ILP_ADMIN_AUTH_TOKEN=admin-b \
 ILP_REDIS_CONNECTION=redis://127.0.0.1:6379/1 \
@@ -106,7 +106,7 @@ ILP_HTTP_ADDRESS=127.0.0.1:8770 \
 ILP_BTP_ADDRESS=127.0.0.1:8768 \
 ILP_SETTLEMENT_ADDRESS=127.0.0.1:8771 \
 ILP_DEFAULT_SPSP_ACCOUNT=0 \
-cargo run --package interledger -- node &> logs/node-b.log &
+cargo run --package interledger -- node &> logs/node_b.log &
 ```
 
 <!--!
@@ -132,7 +132,7 @@ printf "The Interledger.rs nodes are up and running!\n\n"
 -->
 
 Now the Interledger.rs nodes are up and running!  
-You can also watch the logs with: `tail -f logs/node-a.log` or `tail -f logs/node-b.log`.
+You can also watch the logs with: `tail -f logs/node_a.log` or `tail -f logs/node_b.log`.
 
 ### 4. Configure the Nodes
 
@@ -151,11 +151,12 @@ curl \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer admin-a" \
     -d '{
-    "ilp_address": "example.node-a.alice",
+    "ilp_address": "example.node_a.alice",
+    "username" : "alice",
     "asset_code": "ABC",
     "asset_scale": 9,
     "max_packet_amount": 100,
-    "http_incoming_token": "alice"}' \
+    "http_incoming_token": "alice-password"}' \
     http://localhost:7770/accounts
 
 printf "\nNode B's account on Node A:\n"
@@ -163,12 +164,13 @@ curl \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer admin-a" \
     -d '{
-    "ilp_address": "example.node-b",
+    "ilp_address": "example.node_b",
+    "username" : "node_b",
     "asset_code": "ABC",
     "asset_scale": 9,
     "max_packet_amount": 100,
-    "http_incoming_token": "node-b",
-    "http_outgoing_token": "node-a",
+    "http_incoming_token": "node_b-password",
+    "http_outgoing_token": "node_a:node_a-password",
     "http_endpoint": "http://localhost:8770/ilp",
     "min_balance": -100000,
     "routing_relation": "Peer",
@@ -184,7 +186,8 @@ curl \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer admin-b" \
     -d '{
-    "ilp_address": "example.node-b.bob",
+    "ilp_address": "example.node_b.bob",
+    "username" : "bob",
     "asset_code": "ABC",
     "asset_scale": 9,
     "max_packet_amount": 100,
@@ -196,12 +199,13 @@ curl \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer admin-b" \
     -d '{
-    "ilp_address": "example.node-a",
+    "ilp_address": "example.node_a",
+    "username" : "node_a",
     "asset_code": "ABC",
     "asset_scale": 9,
     "max_packet_amount": 100,
-    "http_incoming_token": "node-a",
-    "http_outgoing_token": "node-b",
+    "http_incoming_token": "node_a-password",
+    "http_outgoing_token": "node_b:node_b-password",
     "http_endpoint": "http://localhost:7770/ilp",
     "min_balance": -100000,
     "routing_relation": "Peer",
@@ -220,22 +224,22 @@ printf "Checking balances...\n"
 printf "\nAlice's balance: "
 curl \
 -H "Authorization: Bearer admin-a" \
-http://localhost:7770/accounts/0/balance
+http://localhost:7770/accounts/alice/balance
 
 printf "\nNode B's balance on Node A: "
 curl \
 -H "Authorization: Bearer admin-a" \
-http://localhost:7770/accounts/1/balance
+http://localhost:7770/accounts/node_b/balance
 
 printf "\nNode A's balance on Node B: "
 curl \
 -H "Authorization: Bearer admin-b" \
-http://localhost:8770/accounts/1/balance
+http://localhost:8770/accounts/node_a/balance
 
 printf "\nBob's balance: "
 curl \
 -H "Authorization: Bearer admin-b" \
-http://localhost:8770/accounts/0/balance
+http://localhost:8770/accounts/bob/balance
 
 printf "\n\n"
 -->
@@ -247,9 +251,9 @@ The following script sends a payment from Alice to Bob that is routed from Node 
 ```bash
 # Sending payment of 500 from Alice (on Node A) to Bob (on Node B)
 curl \
-    -H "Authorization: Bearer alice" \
+    -H "Authorization: Bearer alice:alice-password" \
     -H "Content-Type: application/json" \
-    -d '{"receiver":"http://localhost:8770/spsp/0","source_amount":500}' \
+    -d '{"receiver":"http://localhost:8770/spsp/bob","source_amount":500}' \
     http://localhost:7770/pay
 ```
 
@@ -265,22 +269,22 @@ You can run the following script to print each of the accounts' balances (try do
 printf "\nAlice's balance: "
 curl \
 -H "Authorization: Bearer admin-a" \
-http://localhost:7770/accounts/0/balance
+http://localhost:7770/accounts/alice/balance
 
 printf "\nNode B's balance on Node A: "
 curl \
 -H "Authorization: Bearer admin-a" \
-http://localhost:7770/accounts/1/balance
+http://localhost:7770/accounts/node_b/balance
 
 printf "\nNode A's balance on Node B: "
 curl \
 -H "Authorization: Bearer admin-b" \
-http://localhost:8770/accounts/1/balance
+http://localhost:8770/accounts/node_a/balance
 
 printf "\nBob's balance: "
 curl \
 -H "Authorization: Bearer admin-b" \
-http://localhost:8770/accounts/0/balance
+http://localhost:8770/accounts/bob/balance
 ```
 
 <!--! printf "\n\n" -->
@@ -292,6 +296,7 @@ Finally, you can stop all the services as follows:
 
 ```bash
 if lsof -Pi :6379 -sTCP:LISTEN -t >/dev/null ; then
+    redis-cli -p 6379 flushall
     redis-cli -p 6379 shutdown
 fi
 
