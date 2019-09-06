@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="interledger-rs.svg" width="700" alt="Interledger.rs">
+  <img src="docs/interledger-rs.svg" width="700" alt="Interledger.rs">
 </p>
 
 ---
@@ -7,9 +7,9 @@
 
 [![crates.io](https://img.shields.io/crates/v/interledger.svg)](https://crates.io/crates/interledger)
 [![Interledger.rs Documentation](https://docs.rs/interledger/badge.svg)](https://docs.rs/interledger)
-[![CircleCI](https://circleci.com/gh/emschwartz/interledger-rs.svg?style=shield)](https://circleci.com/gh/emschwartz/interledger-rs)
+[![CircleCI](https://circleci.com/gh/interledger-rs/interledger-rs.svg?style=shield)](https://circleci.com/gh/interledger-rs/interledger-rs)
 ![Rust Version](https://img.shields.io/badge/rust-stable-Success)
-[![Docker Image](https://img.shields.io/docker/pulls/emschwartz/interledger-rs.svg?maxAge=2592000)](https://hub.docker.com/r/emschwartz/interledger-rs/)
+[![Docker Image](https://img.shields.io/docker/pulls/interledgerrs/node.svg?maxAge=2592000)](https://hub.docker.com/r/interledgerrs/node/)
 
 ## Understanding Interledger.rs
 - [HTTP API](./docs/api.md)
@@ -25,7 +25,7 @@ Prerequisites:
 
 Install and Run:
 
-1. `git clone https://github.com/emschwartz/interledger-rs && cd interledger-rs`
+1. `git clone https://github.com/interledger-rs/interledger-rs && cd interledger-rs`
 2. `cargo build` (add `--release` to compile the release version, which is slower to compile but faster to run)
 2. `cargo run` (append command line options after a `--` to use the CLI)
 
