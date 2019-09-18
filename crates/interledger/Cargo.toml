@@ -27,13 +27,19 @@ cli = [
     "interledger-store-redis",
     "interledger-api",
 ]
+api = ["interledger-api"]
 btp = ["interledger-btp"]
 ccp = ["interledger-ccp"]
 http = ["interledger-http"]
 store-memory = ["interledger-store-memory"]
+store-redis = ["interledger-store-redis"]
 ildcp = ["interledger-ildcp"]
 spsp = ["interledger-spsp", "stream"]
 stream = ["interledger-stream", "ildcp"]
+settlement = ["interledger-settlement"]
+settlement-engines = ["interledger-settlement-engines", "settlement"]
+router = ["interledger-router"]
+service-util = ["interledger-service-util"]
 
 [dependencies]
 base64 = "0.10.1"
@@ -54,6 +60,7 @@ interledger-router = { path = "../interledger-router", version = "^0.2.2-alpha.1
 interledger-service = { path = "../interledger-service", version = "^0.2.2-alpha.1"}
 interledger-service-util = { path = "../interledger-service-util", version = "^0.2.2-alpha.1", optional = true }
 interledger-settlement = { path = "../interledger-settlement", version = "^0.1.1-alpha.1", optional = true }
+interledger-settlement-engines = { path = "../interledger-settlement-engines", version = "0.1.0", optional = true }
 interledger-spsp = { path = "../interledger-spsp", version = "^0.2.2-alpha.1", optional = true }
 interledger-stream = { path = "../interledger-stream", version = "^0.2.2-alpha.1", optional = true }
 interledger-store-memory = { path = "../interledger-store-memory", version = "^0.2.2-alpha.1", optional = true }
