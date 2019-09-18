@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 
-use interledger_api::NodeStore;
+use interledger_api::{AccountSettings, NodeStore};
 use interledger_btp::{BtpAccount, BtpStore};
 use interledger_http::{HttpAccount, HttpStore};
 use interledger_ildcp::IldcpAccount;
@@ -77,6 +77,81 @@ fn update_accounts() {
                             })
                         })
                     })
+            })
+    }))
+    .unwrap();
+}
+
+#[test]
+fn modify_account_settings_settle_to_overflow() {
+    block_on(test_store().and_then(|(store, context, accounts)| {
+        let mut settings = AccountSettings::default();
+        // Redis.rs cannot save a value larger than i64::MAX
+        settings.settle_to = Some(std::i64::MAX as u64 + 1);
+        let account = accounts[0].clone();
+        let id = account.id();
+        store
+            .modify_account_settings(id, settings)
+            .then(move |ret| {
+                assert!(ret.is_err());
+                let _ = context;
+                Ok(())
+            })
+    }))
+    .unwrap();
+}
+
+use std::default::Default;
+#[test]
+fn modify_account_settings_unchanged() {
+    block_on(test_store().and_then(|(store, context, accounts)| {
+        let settings = AccountSettings::default();
+        let account = accounts[0].clone();
+
+        let id = account.id();
+        store
+            .modify_account_settings(id, settings)
+            .and_then(move |ret| {
+                assert_eq!(
+                    account.get_http_auth_token().unwrap(),
+                    ret.get_http_auth_token().unwrap()
+                );
+                assert_eq!(
+                    account.get_btp_token().unwrap(),
+                    ret.get_btp_token().unwrap()
+                );
+                // Cannot check other parameters since they are only pub(crate).
+                let _ = context;
+                Ok(())
+            })
+    }))
+    .unwrap();
+}
+
+#[test]
+fn modify_account_settings() {
+    block_on(test_store().and_then(|(store, context, accounts)| {
+        let settings = AccountSettings {
+            http_outgoing_token: Some("dylan:test_token".to_owned()),
+            http_incoming_token: Some("http_in_new".to_owned()),
+            btp_outgoing_token: Some("dylan:test".to_owned()),
+            btp_incoming_token: Some("btp_in_new".to_owned()),
+            http_endpoint: Some("http://example.com".to_owned()),
+            btp_uri: Some("http://example.com".to_owned()),
+            settle_threshold: Some(-50),
+            settle_to: Some(100),
+        };
+        let account = accounts[0].clone();
+
+        let id = account.id();
+        store
+            .modify_account_settings(id, settings)
+            .and_then(move |ret| {
+                assert_eq!(ret.get_http_auth_token().unwrap(), "dylan:test_token",);
+                assert_eq!(ret.get_btp_token().unwrap(), &b"dylan:test"[..],);
+                // Cannot check other parameters since they are only pub(crate).
+                let _ = context;
+                Ok(())
             })
     }))
     .unwrap();

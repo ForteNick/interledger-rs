@@ -1,24 +1,29 @@
 use super::types::{Addresses, EthereumAccount, EthereumLedgerTxSigner, EthereumStore};
 use super::utils::{filter_transfer_logs, make_tx, sent_to_us, ERC20Transfer};
+use super::EthAddress;
 use clarity::Signature;
 use log::{debug, error, trace};
+use parking_lot::RwLock;
 use sha3::{Digest, Keccak256 as Sha3};
 use std::collections::HashMap;
 use std::iter::FromIterator;
+use std::sync::Arc;
 
 use hyper::StatusCode;
 use log::info;
 use num_bigint::BigUint;
+use redis::ConnectionInfo;
 use redis::IntoConnectionInfo;
 use reqwest::r#async::{Client, Response as HttpResponse};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as DeserializeError, Deserialize, Deserializer, Serialize};
 use serde_json::json;
+use std::net::SocketAddr;
 use std::{
     marker::PhantomData,
     str::FromStr,
     time::{Duration, Instant},
 };
-use std::{net::SocketAddr, str, u64};
+use std::{str, u64};
 use tokio::net::TcpListener;
 use tokio::timer::Interval;
 use tokio_retry::{strategy::ExponentialBackoff, Retry};
@@ -35,19 +40,36 @@ use web3::{
 use crate::stores::{redis_ethereum_ledger::*, LeftoversStore};
 use crate::{ApiResponse, CreateAccount, SettlementEngine, SettlementEngineApi};
 use interledger_settlement::{Convert, ConvertDetails, Quantity};
+use secrecy::Secret;
 
 const MAX_RETRIES: usize = 10;
 const ETH_CREATE_ACCOUNT_PREFIX: &[u8] = b"ilp-ethl-create-account-message";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct PaymentDetailsRequest {
+    challenge: Vec<u8>,
+}
+
+impl PaymentDetailsRequest {
+    fn new(challenge: Vec<u8>) -> Self {
+        PaymentDetailsRequest { challenge }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PaymentDetailsResponse {
     to: Addresses,
-    sig: Signature,
+    signature: Signature,
+    challenge: Option<Vec<u8>>,
 }
 
 impl PaymentDetailsResponse {
-    fn new(to: Addresses, sig: Signature) -> Self {
-        PaymentDetailsResponse { to, sig }
+    fn new(to: Addresses, signature: Signature, challenge: Option<Vec<u8>>) -> Self {
+        PaymentDetailsResponse {
+            to,
+            signature,
+            challenge,
+        }
     }
 }
 
@@ -78,6 +100,7 @@ pub struct EthereumLedgerSettlementEngine<S, Si, A> {
     poll_frequency: Duration,
     connector_url: Url,
     asset_scale: u8,
+    challenges: Arc<RwLock<HashMap<String, Vec<u8>>>>,
 }
 
 pub struct EthereumLedgerSettlementEngineBuilder<'a, S, Si, A> {
@@ -215,6 +238,7 @@ where
             connector_url,
             asset_scale,
             account_type: PhantomData,
+            challenges: Arc::new(RwLock::new(HashMap::new())),
         };
         if self.watch_incoming {
             engine.notify_connector_on_incoming_settlement();
@@ -773,6 +797,8 @@ where
         let self_clone = self.clone();
         let store: S = self.store.clone();
         let account_id = account_id.id;
+        let signer = self.signer.clone();
+        let address = self.address;
 
         // We make a POST request to OUR connector's `messages`
         // endpoint. This will in turn send an outgoing
@@ -786,17 +812,22 @@ where
         let challenge_clone = challenge.clone();
         let client = Client::new();
         let mut url = self_clone.connector_url.clone();
+
+        // send a payment details request (we send them a challenge)
         url.path_segments_mut()
             .expect("Invalid connector URL")
             .push("accounts")
             .push(&account_id.to_string())
             .push("messages");
+        let body =
+            serde_json::to_string(&PaymentDetailsRequest::new(challenge_clone.clone())).unwrap();
+        let url_clone = url.clone();
         let action = move || {
             client
                 .post(url.as_ref())
                 .header("Content-Type", "application/octet-stream")
                 .header("Idempotency-Key", idempotency_uuid.clone())
-                .body(challenge.clone())
+                .body(body.clone())
                 .send()
         };
 
@@ -812,45 +843,84 @@ where
             })
             .and_then(move |resp| {
                 parse_body_into_payment_details(resp).and_then(move |payment_details| {
-                    let data = prefixed_mesage(challenge_clone);
+                    let data = prefixed_message(challenge_clone);
                     let challenge_hash = Sha3::digest(&data);
-                    let recovered_address = payment_details.sig.recover(&challenge_hash);
+                    let recovered_address = payment_details.signature.recover(&challenge_hash);
                     trace!("Received payment details {:?}", payment_details);
-                    result(recovered_address)
-                        .map_err(move |err| {
-                            let err = format!("Could not recover address {:?}", err);
-                            error!("{}", err);
-                            (StatusCode::from_u16(502).unwrap(), err)
-                        })
-                        .and_then({
-                            let payment_details = payment_details.clone();
-                            move |recovered_address| {
-                                if recovered_address.as_bytes()
-                                    == &payment_details.to.own_address.as_bytes()[..]
-                                {
-                                    ok(())
-                                } else {
-                                    let error_msg = format!(
-                                        "Recovered address did not match: {:?}. Expected {:?}",
-                                        recovered_address.to_string(),
-                                        payment_details.to
-                                    );
-                                    error!("{}", error_msg);
-                                    err((StatusCode::from_u16(502).unwrap(), error_msg))
-                                }
+                    match recovered_address {
+                        Ok(recovered_address) => {
+                            if recovered_address.as_bytes()
+                                != &payment_details.to.own_address.as_bytes()[..]
+                            {
+                                let error_msg = format!(
+                                    "Recovered address did not match: {:?}. Expected {:?}",
+                                    recovered_address.to_string(),
+                                    payment_details.to
+                                );
+                                error!("{}", error_msg);
+                                return Either::A(err((
+                                    StatusCode::from_u16(502).unwrap(),
+                                    error_msg,
+                                )));
                             }
-                        })
-                        .and_then(move |_| {
-                            let data = HashMap::from_iter(vec![(account_id, payment_details.to)]);
-                            store.save_account_addresses(data).map_err(move |err| {
+                        }
+                        Err(error_msg) => {
+                            let error_msg = format!("Could not recover address {:?}", error_msg);
+                            error!("{}", error_msg);
+                            return Either::A(err((StatusCode::from_u16(400).unwrap(), error_msg)));
+                        }
+                    };
+
+                    // ACK BACK
+                    if let Some(challenge) = payment_details.challenge {
+                        // if we were challenged, we must respond
+                        let data = prefixed_message(challenge);
+                        let signature = signer.sign_message(&data);
+                        let resp = {
+                            // Respond with our address, a signature,
+                            // and no challenge, since we already sent
+                            // them one earlier
+                            let ret = PaymentDetailsResponse::new(address, signature, None);
+                            serde_json::to_string(&ret).unwrap()
+                        };
+                        let idempotency_uuid = Uuid::new_v4().to_hyphenated().to_string();
+                        let client = Client::new();
+                        let action = move || {
+                            client
+                                .post(url_clone.as_ref())
+                                .header("Content-Type", "application/octet-stream")
+                                .header("Idempotency-Key", idempotency_uuid.clone())
+                                .body(resp.clone())
+                                .send()
+                                .map_err(|err| error!("{}", err))
+                                .and_then(move |_| Ok(()))
+                        };
+
+                        tokio::executor::spawn(
+                            Retry::spawn(
+                                ExponentialBackoff::from_millis(10).take(MAX_RETRIES),
+                                action,
+                            )
+                            .map_err(|err| error!("{:?}", err)),
+                        );
+                    }
+
+                    let data = HashMap::from_iter(vec![(account_id, payment_details.to)]);
+
+                    Either::B(
+                        store
+                            .save_account_addresses(data)
+                            .map_err(move |err| {
                                 let err = format!("Couldn't connect to store {:?}", err);
                                 error!("{}", err);
                                 (StatusCode::from_u16(500).unwrap(), err)
                             })
-                        })
+                            .and_then(move |_| {
+                                Ok((StatusCode::from_u16(201).unwrap(), "CREATED".to_owned()))
+                            }),
+                    )
                 })
-            })
-            .and_then(move |_| Ok((StatusCode::from_u16(201).unwrap(), "CREATED".to_owned()))),
+            }),
         )
     }
 
@@ -864,20 +934,75 @@ where
         body: Vec<u8>,
     ) -> Box<dyn Future<Item = ApiResponse, Error = ApiResponse> + Send> {
         let address = self.address;
+        let store = self.store.clone();
         // We are only returning our information, so
         // there is no need to return any data about the
         // provided account.
-        debug!(
-            "Responding with our account's details {} {:?}",
-            account_id, address
-        );
-        let data = prefixed_mesage(body.clone());
-        let signature = self.signer.sign_message(&data);
-        let resp = {
-            let ret = PaymentDetailsResponse::new(address, signature);
-            serde_json::to_string(&ret).unwrap()
-        };
-        Box::new(ok((StatusCode::from_u16(200).unwrap(), resp)))
+        // If we received a SYN, we respond with a signed message
+        if let Ok(req) = serde_json::from_slice::<PaymentDetailsRequest>(&body) {
+            debug!(
+                "Received account creation request. Responding with our account's details {} {:?}",
+                account_id, address
+            );
+            // Otherwise, we save the received address
+            let data = prefixed_message(req.challenge);
+            let signature = self.signer.sign_message(&data);
+            let resp = {
+                let challenge = Uuid::new_v4().to_hyphenated().to_string();
+                let challenge = challenge.into_bytes();
+                let mut guard = self.challenges.write();
+                (*guard).insert(account_id, challenge.clone());
+                // Respond with our address, a signature, and our own challenge
+                let ret = PaymentDetailsResponse::new(address, signature, Some(challenge));
+                serde_json::to_string(&ret).unwrap()
+            };
+            Box::new(ok((StatusCode::from_u16(200).unwrap(), resp)))
+        } else if let Ok(resp) = serde_json::from_slice::<PaymentDetailsResponse>(&body) {
+            debug!("Received payment details: {:?}", resp);
+            let guard = self.challenges.read();
+            let fut = if let Some(challenge) = (*guard).get(&account_id) {
+                // if we sent them a challenge, we will verify the received
+                // signature and address, and if sig verification passes, we'll
+                // save them in our store
+                let data = prefixed_message(challenge.to_vec());
+                let challenge_hash = Sha3::digest(&data);
+                let recovered_address = resp.signature.recover(&challenge_hash);
+                match recovered_address {
+                    Ok(recovered_address) => {
+                        Either::A(
+                            if recovered_address.as_bytes() != &resp.to.own_address.as_bytes()[..] {
+                                Either::A(ok(()))
+                            } else {
+                                // save to the store
+                                let data = HashMap::from_iter(vec![(account_id, resp.to)]);
+                                Either::B(store.save_account_addresses(data).map_err(move |err| {
+                                    let err = format!("Couldn't connect to store {:?}", err);
+                                    error!("{}", err);
+                                    (StatusCode::from_u16(500).unwrap(), err)
+                                }))
+                            },
+                        )
+                    }
+                    Err(error_msg) => {
+                        let error_msg = format!("Could not recover address {:?}", error_msg);
+                        error!("{}", error_msg);
+                        Either::B(err((StatusCode::from_u16(400).unwrap(), error_msg)))
+                    }
+                }
+            } else {
+                Either::B(ok(()))
+            };
+
+            Box::new(
+                fut.and_then(move |_| Ok((StatusCode::from_u16(200).unwrap(), "OK".to_string()))),
+            )
+        } else {
+            error!("Ignoring message that was neither a PaymentDetailsRequest nor a PaymentDetailsResponse");
+            Box::new(err((
+                StatusCode::from_u16(400).unwrap(),
+                "Invalid message type".to_owned(),
+            )))
+        }
     }
     /// Settlement Engine's function that corresponds to the
     /// /accounts/:id/settlements endpoint (POST). It performs an Ethereum
@@ -975,7 +1100,7 @@ fn parse_body_into_payment_details(
         })
 }
 
-fn prefixed_mesage(challenge: Vec<u8>) -> Vec<u8> {
+fn prefixed_message(challenge: Vec<u8>) -> Vec<u8> {
     let mut ret = ETH_CREATE_ACCOUNT_PREFIX.to_vec();
     ret.extend(challenge);
     ret
@@ -983,47 +1108,67 @@ fn prefixed_mesage(challenge: Vec<u8>) -> Vec<u8> {
 
 #[doc(hidden)]
 #[allow(clippy::all)]
-pub fn run_ethereum_engine<R, Si>(
-    redis_uri: R,
-    ethereum_endpoint: String,
-    settlement_port: u16,
-    private_key: Si,
-    chain_id: u8,
-    confirmations: u8,
-    asset_scale: u8,
-    poll_frequency: u64,
-    connector_url: String,
-    token_address: Option<Address>,
-    watch_incoming: bool,
-) -> impl Future<Item = (), Error = ()>
-where
-    R: IntoConnectionInfo,
-    Si: EthereumLedgerTxSigner + Clone + Send + Sync + 'static,
-{
-    let redis_uri = redis_uri.into_connection_info().unwrap();
+pub fn run_ethereum_engine(opt: EthereumLedgerOpt) -> impl Future<Item = (), Error = ()> {
+    // TODO make key compatible with
+    // https://github.com/tendermint/signatory to have HSM sigs
 
-    EthereumLedgerRedisStoreBuilder::new(redis_uri.clone())
+    EthereumLedgerRedisStoreBuilder::new(opt.redis_connection.clone())
         .connect()
         .and_then(move |ethereum_store| {
             let engine =
-                EthereumLedgerSettlementEngineBuilder::new(ethereum_store.clone(), private_key)
-                    .ethereum_endpoint(&ethereum_endpoint)
-                    .chain_id(chain_id)
-                    .connector_url(&connector_url)
-                    .confirmations(confirmations)
-                    .asset_scale(asset_scale)
-                    .poll_frequency(poll_frequency)
-                    .watch_incoming(watch_incoming)
-                    .token_address(token_address)
+                EthereumLedgerSettlementEngineBuilder::new(ethereum_store.clone(), opt.private_key)
+                    .ethereum_endpoint(&opt.ethereum_url)
+                    .chain_id(opt.chain_id)
+                    .connector_url(&opt.connector_url)
+                    .confirmations(opt.confirmations)
+                    .asset_scale(opt.asset_scale)
+                    .poll_frequency(opt.poll_frequency)
+                    .watch_incoming(opt.watch_incoming)
+                    .token_address(opt.token_address)
                     .connect();
 
-            let addr = SocketAddr::from(([127, 0, 0, 1], settlement_port));
-            let listener =
-                TcpListener::bind(&addr).expect("Unable to bind to Settlement Engine address");
+            let listener = TcpListener::bind(&opt.settlement_api_bind_address)
+                .expect("Unable to bind to Settlement Engine address");
             let api = SettlementEngineApi::new(engine, ethereum_store);
             tokio::spawn(api.serve(listener.incoming()));
-            info!("Ethereum Settlement Engine listening on: {}", addr);
+            info!(
+                "Ethereum Settlement Engine listening on: {}",
+                &opt.settlement_api_bind_address
+            );
             Ok(())
+        })
+}
+
+#[derive(Deserialize, Clone)]
+pub struct EthereumLedgerOpt {
+    pub private_key: Secret<String>,
+    pub settlement_api_bind_address: SocketAddr,
+    pub ethereum_url: String,
+    pub token_address: Option<EthAddress>,
+    pub connector_url: String,
+    #[serde(deserialize_with = "deserialize_redis_connection", alias = "redis_url")]
+    pub redis_connection: ConnectionInfo,
+    // Although the length of `chain_id` seems to be not limited on its specs,
+    // u8 seems sufficient at this point.
+    pub chain_id: u8,
+    pub confirmations: u8,
+    pub asset_scale: u8,
+    pub poll_frequency: u64,
+    pub watch_incoming: bool,
+}
+
+fn deserialize_redis_connection<'de, D>(deserializer: D) -> Result<ConnectionInfo, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Url::parse(&String::deserialize(deserializer)?)
+        .map_err(|err| DeserializeError::custom(format!("Invalid URL: {:?}", err)))?
+        .into_connection_info()
+        .map_err(|err| {
+            DeserializeError::custom(format!(
+                "Error converting into Redis connection info: {:?}",
+                err
+            ))
         })
 }
 
@@ -1059,7 +1204,8 @@ mod tests {
                 own_address: bob.address,
                 token_address: None,
             },
-            sig: signature,
+            signature,
+            challenge: None,
         })
         .unwrap();
 
@@ -1099,7 +1245,7 @@ mod tests {
         let bob: TestAccount = BOB.clone();
 
         let challenge = Uuid::new_v4().to_hyphenated().to_string().into_bytes();
-        let signed_challenge = prefixed_mesage(challenge.clone());
+        let signed_challenge = prefixed_message(challenge.clone());
 
         let signature = ALICE_PK.clone().sign_message(&signed_challenge);
 
@@ -1114,7 +1260,8 @@ mod tests {
         );
 
         // Alice's engine receives a challenge by Bob.
-        let ret = block_on(engine.receive_message(bob.id.to_string(), challenge)).unwrap();
+        let c = serde_json::to_vec(&PaymentDetailsRequest::new(challenge)).unwrap();
+        let ret = block_on(engine.receive_message(bob.id.to_string(), c)).unwrap();
         assert_eq!(ret.0.as_u16(), 200);
 
         let alice_addrs = Addresses {
@@ -1125,7 +1272,31 @@ mod tests {
         // The returned addresses must be Alice's
         assert_eq!(data.to, alice_addrs);
         // The returned signature must be Alice's sig.
-        assert_eq!(data.sig, signature);
+        assert_eq!(data.signature, signature);
+        // The returned challenge is sent over to Bob, who will use it to send
+        // his address back
+        assert!(data.challenge.is_some());
+
+        // Alice's engine now receives Bob's addresses
+        let challenge = data.challenge.unwrap();
+        let signed_challenge = prefixed_message(challenge.clone());
+        let signature = BOB_PK.clone().sign_message(&signed_challenge);
+        let bob_addrs = Addresses {
+            own_address: BOB.address,
+            token_address: None,
+        };
+        let c =
+            serde_json::to_vec(&PaymentDetailsResponse::new(bob_addrs, signature, None)).unwrap();
+        let ret = block_on(engine.receive_message(bob.id.to_string(), c)).unwrap();
+        assert_eq!(ret.0.as_u16(), 200);
+        assert_eq!(ret.1, "OK".to_owned());
+
+        // check that alice's store got updated with bob's addresses
+        let addrs = store
+            .load_account_addresses(vec![bob.id.to_string()])
+            .wait()
+            .unwrap();
+        assert_eq!(addrs[0], bob_addrs);
     }
 
     #[test]

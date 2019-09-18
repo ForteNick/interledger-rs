@@ -7,20 +7,22 @@ use interledger::{
     node::{AccountDetails, InterledgerNode},
 };
 use interledger_packet::Address;
+use interledger_service::Username;
 use serde_json::json;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use tokio::runtime::Builder as RuntimeBuilder;
 
-mod redis_helpers;
-use redis_helpers::*;
-
 mod test_helpers;
-use interledger_service::Username;
 use test_helpers::{
-    accounts_to_ids, create_account_on_engine, get_all_accounts, get_balance,
-    send_money_to_username, start_eth_engine, start_ganache, start_xrp_engine,
+    accounts_to_ids, create_account_on_engine, get_all_accounts, get_balance, redis_helpers::*,
+    send_money_to_username, start_ganache, start_xrp_engine,
 };
 
+#[cfg(feature = "ethereum")]
+use test_helpers::start_eth_engine;
+
+#[cfg(feature = "ethereum")]
 #[test]
 fn eth_xrp_interoperable() {
     let eth_decimals = 9;
@@ -42,10 +44,12 @@ fn eth_xrp_interoperable() {
     let node1_http = get_open_port(Some(3010));
     let node1_settlement = get_open_port(Some(3011));
     let node1_engine = get_open_port(Some(3012));
+    let node1_engine_address = SocketAddr::from(([127, 0, 0, 1], node1_engine));
 
     let node2_http = get_open_port(Some(3020));
     let node2_settlement = get_open_port(Some(3021));
     let node2_engine = get_open_port(Some(3022));
+    let node2_engine_address = SocketAddr::from(([127, 0, 0, 1], node2_engine));
     let node2_xrp_engine_port = get_open_port(Some(3023));
     let node2_btp = get_open_port(Some(3024));
 
@@ -82,13 +86,13 @@ fn eth_xrp_interoperable() {
         "cc96601bc52293b53c4736a12af9130abf347669b3813f9ec4cafdf6991b087e".to_string();
     let node1_eth_engine_fut = start_eth_engine(
         connection_info1.clone(),
-        node1_engine,
+        node1_engine_address,
         node1_eth_key,
         node1_settlement,
     );
     let node2_eth_engine_fut = start_eth_engine(
         connection_info2.clone(),
-        node2_engine,
+        node2_engine_address,
         node2_eth_key,
         node2_settlement,
     );
@@ -103,11 +107,14 @@ fn eth_xrp_interoperable() {
         default_spsp_account: None,
         admin_auth_token: "admin".to_string(),
         redis_connection: connection_info1,
-        btp_address: ([127, 0, 0, 1], get_open_port(None)).into(),
-        http_address: ([127, 0, 0, 1], node1_http).into(),
-        settlement_address: ([127, 0, 0, 1], node1_settlement).into(),
+        btp_bind_address: ([127, 0, 0, 1], get_open_port(None)).into(),
+        http_bind_address: ([127, 0, 0, 1], node1_http).into(),
+        settlement_api_bind_address: ([127, 0, 0, 1], node1_settlement).into(),
         secret_seed: cli::random_secret(),
         route_broadcast_interval: Some(200),
+        exchange_rate_poll_interval: 60000,
+        exchange_rate_provider: None,
+        exchange_rate_spread: 0.0,
     };
     let node1_clone = node1.clone();
     runtime.spawn(
@@ -128,8 +135,6 @@ fn eth_xrp_interoperable() {
                     min_balance: None,
                     settle_threshold: None,
                     settle_to: None,
-                    send_routes: false,
-                    receive_routes: false,
                     routing_relation: None,
                     round_trip_time: None,
                     packets_per_minute_limit: None,
@@ -153,8 +158,6 @@ fn eth_xrp_interoperable() {
                     min_balance: Some(-100_000),
                     settle_threshold: Some(70000),
                     settle_to: Some(10000),
-                    send_routes: true,
-                    receive_routes: true,
                     routing_relation: Some("Peer".to_string()),
                     round_trip_time: None,
                     packets_per_minute_limit: None,
@@ -170,11 +173,14 @@ fn eth_xrp_interoperable() {
         default_spsp_account: None,
         admin_auth_token: "admin".to_string(),
         redis_connection: connection_info2,
-        btp_address: ([127, 0, 0, 1], node2_btp).into(),
-        http_address: ([127, 0, 0, 1], node2_http).into(),
-        settlement_address: ([127, 0, 0, 1], node2_settlement).into(),
+        btp_bind_address: ([127, 0, 0, 1], node2_btp).into(),
+        http_bind_address: ([127, 0, 0, 1], node2_http).into(),
+        settlement_api_bind_address: ([127, 0, 0, 1], node2_settlement).into(),
         secret_seed: cli::random_secret(),
         route_broadcast_interval: Some(200),
+        exchange_rate_poll_interval: 60000,
+        exchange_rate_provider: None,
+        exchange_rate_spread: 0.0,
     };
     let node2_clone = node2.clone();
     runtime.spawn(
@@ -195,8 +201,6 @@ fn eth_xrp_interoperable() {
                         min_balance: Some(-100_000),
                         settle_threshold: None,
                         settle_to: None,
-                        send_routes: true,
-                        receive_routes: true,
                         routing_relation: Some("Peer".to_string()),
                         round_trip_time: None,
                         packets_per_minute_limit: None,
@@ -218,8 +222,6 @@ fn eth_xrp_interoperable() {
                             min_balance: Some(-100),
                             settle_threshold: Some(70000),
                             settle_to: Some(5000),
-                            send_routes: false,
-                            receive_routes: true,
                             routing_relation: Some("Child".to_string()),
                             round_trip_time: None,
                             packets_per_minute_limit: None,
@@ -254,11 +256,14 @@ fn eth_xrp_interoperable() {
         default_spsp_account: None,
         admin_auth_token: "admin".to_string(),
         redis_connection: connection_info3,
-        btp_address: ([127, 0, 0, 1], get_open_port(None)).into(),
-        http_address: ([127, 0, 0, 1], node3_http).into(),
-        settlement_address: ([127, 0, 0, 1], node3_settlement).into(),
+        btp_bind_address: ([127, 0, 0, 1], get_open_port(None)).into(),
+        http_bind_address: ([127, 0, 0, 1], node3_http).into(),
+        settlement_api_bind_address: ([127, 0, 0, 1], node3_settlement).into(),
         secret_seed: cli::random_secret(),
         route_broadcast_interval: Some(200),
+        exchange_rate_poll_interval: 60000,
+        exchange_rate_provider: None,
+        exchange_rate_spread: 0.0,
     };
     let node3_clone = node3.clone();
     runtime.spawn(
@@ -281,8 +286,6 @@ fn eth_xrp_interoperable() {
                         min_balance: None,
                         settle_threshold: None,
                         settle_to: None,
-                        send_routes: false,
-                        receive_routes: false,
                         routing_relation: None,
                         round_trip_time: None,
                         packets_per_minute_limit: None,
@@ -304,8 +307,6 @@ fn eth_xrp_interoperable() {
                             min_balance: Some(-100_000),
                             settle_threshold: None,
                             settle_to: None,
-                            send_routes: true,
-                            receive_routes: false,
                             routing_relation: Some("Parent".to_string()),
                             round_trip_time: None,
                             packets_per_minute_limit: None,
@@ -330,24 +331,20 @@ fn eth_xrp_interoperable() {
                     let bob_addr = Address::from_str("example.bob").unwrap();
                     let alice_addr = Address::from_str("example.alice").unwrap();
                     futures::future::join_all(vec![
-                        get_all_accounts(node1_http, "admin").map(accounts_to_ids),
                         get_all_accounts(node2_http, "admin").map(accounts_to_ids),
                         get_all_accounts(node3_http, "admin").map(accounts_to_ids),
                     ])
                     .and_then(move |ids| {
-                        let node1_ids = ids[0].clone();
-                        let node2_ids = ids[1].clone();
-                        let node3_ids = ids[2].clone();
+                        let node2_ids = ids[0].clone();
+                        let node3_ids = ids[1].clone();
 
-                        let bob_on_alice = node1_ids.get(&bob_addr).unwrap().to_owned();
                         let alice_on_bob = node2_ids.get(&alice_addr).unwrap().to_owned();
                         let charlie_on_bob = node2_ids.get(&charlie_addr).unwrap().to_owned();
                         let bob_on_charlie = node3_ids.get(&bob_addr).unwrap().to_owned();
 
                         // Insert accounts for the 3 nodes (4 total since node2 has
                         // eth & xrp)
-                        create_account_on_engine(node1_engine, bob_on_alice)
-                            .and_then(move |_| create_account_on_engine(node2_engine, alice_on_bob))
+                        create_account_on_engine(node2_engine, alice_on_bob)
                             .and_then(move |_| {
                                 create_account_on_engine(node2_xrp_engine_port, charlie_on_bob)
                             })
