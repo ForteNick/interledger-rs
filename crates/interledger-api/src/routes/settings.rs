@@ -24,7 +24,9 @@ struct ServerStatus {
 #[web(status = "200")]
 struct Success;
 
-#[derive(Extract, Debug)]
+#[derive(Extract, Debug, Response)]
+// TODO should this use stringified floats instead of JSON numbers?
+#[web(status = "200")]
 struct Rates(HashMap<String, f64>);
 
 #[derive(Extract, Response, Debug)]
@@ -68,17 +70,27 @@ impl_web! {
 
         #[put("/rates")]
         #[content_type("application/json")]
-        fn post_rates(&self, body: Rates, authorization: String) -> impl Future<Item = Success, Error = Response<()>> {
+        fn put_rates(&self, body: Rates, authorization: String) -> impl Future<Item = Success, Error = Response<()>> {
             debug!("Setting exchange rates: {:?}", body);
             self.validate_admin(authorization)
                 .and_then(move |store| {
-                    store.set_rates(body.0)
+                    store.set_exchange_rates(body.0)
                         .and_then(|_| Ok(Success))
                         .map_err(|err| {
                             error!("Error setting rates: {:?}", err);
                             Response::builder().status(500).body(()).unwrap()
                         })
                 })
+        }
+
+        #[get("/rates")]
+        #[content_type("application/json")]
+        fn get_rates(&self) -> impl Future<Item = Rates, Error = Response<()>> {
+            if let Ok(rates) = self.store.get_all_exchange_rates() {
+                ok(Rates(rates))
+            } else {
+                err(Response::builder().status(500).body(()).unwrap())
+            }
         }
 
         #[get("/routes")]

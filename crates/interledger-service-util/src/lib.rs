@@ -4,6 +4,7 @@
 
 mod balance_service;
 mod echo_service;
+mod exchange_rate_providers;
 mod exchange_rates_service;
 mod expiry_shortener_service;
 mod max_packet_amount_service;
@@ -12,7 +13,9 @@ mod validator_service;
 
 pub use self::balance_service::{BalanceService, BalanceStore};
 pub use self::echo_service::EchoService;
-pub use self::exchange_rates_service::{ExchangeRateService, ExchangeRateStore};
+pub use self::exchange_rates_service::{
+    ExchangeRateFetcher, ExchangeRateProvider, ExchangeRateService, ExchangeRateStore,
+};
 pub use self::expiry_shortener_service::{
     ExpiryShortenerService, RoundTripTimeAccount, DEFAULT_ROUND_TRIP_TIME,
 };

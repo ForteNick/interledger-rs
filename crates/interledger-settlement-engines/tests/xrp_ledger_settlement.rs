@@ -12,12 +12,9 @@ use interledger_service::Username;
 use std::str::FromStr;
 use tokio::runtime::Builder as RuntimeBuilder;
 
-mod redis_helpers;
-use redis_helpers::*;
-
 mod test_helpers;
 use test_helpers::{
-    accounts_to_ids, create_account_on_engine, get_all_accounts, get_balance,
+    accounts_to_ids, create_account_on_engine, get_all_accounts, get_balance, redis_helpers::*,
     send_money_to_username, start_xrp_engine,
 };
 
@@ -82,11 +79,14 @@ fn xrp_ledger_settlement() {
         default_spsp_account: None,
         admin_auth_token: "hi_alice".to_string(),
         redis_connection: connection_info1.clone(),
-        btp_address: ([127, 0, 0, 1], get_open_port(None)).into(),
-        http_address: ([127, 0, 0, 1], node1_http).into(),
-        settlement_address: ([127, 0, 0, 1], node1_settlement).into(),
+        btp_bind_address: ([127, 0, 0, 1], get_open_port(None)).into(),
+        http_bind_address: ([127, 0, 0, 1], node1_http).into(),
+        settlement_api_bind_address: ([127, 0, 0, 1], node1_settlement).into(),
         secret_seed: node1_secret,
         route_broadcast_interval: Some(200),
+        exchange_rate_poll_interval: 60000,
+        exchange_rate_provider: None,
+        exchange_rate_spread: 0.0,
     };
     let node1_clone = node1.clone();
     runtime.spawn(
@@ -106,8 +106,6 @@ fn xrp_ledger_settlement() {
                 min_balance: None,
                 settle_threshold: None,
                 settle_to: Some(-10),
-                send_routes: false,
-                receive_routes: false,
                 routing_relation: None,
                 round_trip_time: None,
                 packets_per_minute_limit: None,
@@ -129,8 +127,6 @@ fn xrp_ledger_settlement() {
                     min_balance: Some(-100),
                     settle_threshold: Some(70),
                     settle_to: Some(10),
-                    send_routes: false,
-                    receive_routes: false,
                     routing_relation: None,
                     round_trip_time: None,
                     packets_per_minute_limit: None,
@@ -147,11 +143,14 @@ fn xrp_ledger_settlement() {
         default_spsp_account: None,
         admin_auth_token: "admin".to_string(),
         redis_connection: connection_info2.clone(),
-        btp_address: ([127, 0, 0, 1], get_open_port(None)).into(),
-        http_address: ([127, 0, 0, 1], node2_http).into(),
-        settlement_address: ([127, 0, 0, 1], node2_settlement).into(),
+        btp_bind_address: ([127, 0, 0, 1], get_open_port(None)).into(),
+        http_bind_address: ([127, 0, 0, 1], node2_http).into(),
+        settlement_api_bind_address: ([127, 0, 0, 1], node2_settlement).into(),
         secret_seed: node2_secret,
         route_broadcast_interval: Some(200),
+        exchange_rate_poll_interval: 60000,
+        exchange_rate_provider: None,
+        exchange_rate_spread: 0.0,
     };
     runtime.spawn(
         node2
@@ -169,8 +168,6 @@ fn xrp_ledger_settlement() {
                 min_balance: None,
                 settle_threshold: None,
                 settle_to: None,
-                send_routes: false,
-                receive_routes: false,
                 routing_relation: None,
                 round_trip_time: None,
                 packets_per_minute_limit: None,
@@ -193,8 +190,6 @@ fn xrp_ledger_settlement() {
                         min_balance: Some(-100),
                         settle_threshold: Some(70),
                         settle_to: Some(-10),
-                        send_routes: false,
-                        receive_routes: false,
                         routing_relation: None,
                         round_trip_time: None,
                         packets_per_minute_limit: None,

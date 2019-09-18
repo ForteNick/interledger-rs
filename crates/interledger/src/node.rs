@@ -1,3 +1,4 @@
+use super::cli::tokio_run;
 use bytes::Bytes;
 use futures::{future::result, Future};
 use hex::FromHex;
@@ -12,8 +13,9 @@ use interledger_router::Router;
 use interledger_service::{
     outgoing_service_fn, Account as AccountTrait, OutgoingRequest, Username,
 };
+pub use interledger_service_util::ExchangeRateProvider; // Note this is re-exported
 use interledger_service_util::{
-    BalanceService, EchoService, ExchangeRateService, ExpiryShortenerService,
+    BalanceService, EchoService, ExchangeRateFetcher, ExchangeRateService, ExpiryShortenerService,
     MaxPacketAmountService, RateLimitService, ValidatorService,
 };
 use interledger_settlement::{SettlementApi, SettlementMessageService};
@@ -24,24 +26,27 @@ use interledger_stream::StreamReceiverService;
 use log::{debug, error, info, trace};
 use ring::{digest, hmac};
 use serde::{de::Error as DeserializeError, Deserialize, Deserializer};
-use std::{net::SocketAddr, str};
-use tokio::{self, net::TcpListener};
+use std::{net::SocketAddr, str, time::Duration};
+use tokio::{net::TcpListener, spawn};
 use url::Url;
 
 static REDIS_SECRET_GENERATION_STRING: &str = "ilp_redis_secret";
 static DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
 
-fn default_settlement_address() -> SocketAddr {
+fn default_settlement_api_bind_address() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 7771))
 }
-fn default_http_address() -> SocketAddr {
+fn default_http_bind_address() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 7770))
 }
-fn default_btp_address() -> SocketAddr {
+fn default_btp_bind_address() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 7768))
 }
-fn default_redis_uri() -> ConnectionInfo {
+fn default_redis_url() -> ConnectionInfo {
     DEFAULT_REDIS_URL.into_connection_info().unwrap()
+}
+fn default_exchange_rate_poll_interval() -> u64 {
+    60000
 }
 
 use std::str::FromStr;
@@ -85,8 +90,6 @@ where
 #[derive(Deserialize, Clone)]
 pub struct InterledgerNode {
     /// ILP address of the node
-    // Rename this one because the env vars are prefixed with "ILP_"
-    #[serde(alias = "address")]
     #[serde(deserialize_with = "deserialize_string_to_address")]
     pub ilp_address: Address,
     /// Root secret used to derive encryption keys
@@ -97,19 +100,20 @@ pub struct InterledgerNode {
     /// Redis URI (for example, "redis://127.0.0.1:6379" or "unix:/tmp/redis.sock")
     #[serde(
         deserialize_with = "deserialize_redis_connection",
-        default = "default_redis_uri"
+        default = "default_redis_url",
+        alias = "redis_url"
     )]
     pub redis_connection: ConnectionInfo,
     /// IP address and port to listen for HTTP connections
     /// This is used for both the API and ILP over HTTP packets
-    #[serde(default = "default_http_address")]
-    pub http_address: SocketAddr,
+    #[serde(default = "default_http_bind_address")]
+    pub http_bind_address: SocketAddr,
     /// IP address and port to listen for the Settlement Engine API
-    #[serde(default = "default_settlement_address")]
-    pub settlement_address: SocketAddr,
+    #[serde(default = "default_settlement_api_bind_address")]
+    pub settlement_api_bind_address: SocketAddr,
     /// IP address and port to listen for BTP connections
-    #[serde(default = "default_btp_address")]
-    pub btp_address: SocketAddr,
+    #[serde(default = "default_btp_bind_address")]
+    pub btp_bind_address: SocketAddr,
     /// When SPSP payments are sent to the root domain, the payment pointer is resolved
     /// to <domain>/.well-known/pay. This value determines which account those payments
     /// will be sent to.
@@ -117,6 +121,23 @@ pub struct InterledgerNode {
     /// Interval, defined in milliseconds, on which the node will broadcast routing
     /// information to other nodes using CCP. Defaults to 30000ms (30 seconds).
     pub route_broadcast_interval: Option<u64>,
+    /// Interval, defined in milliseconds, on which the node will poll the exchange rate provider.
+    /// Defaults to 60000ms (60 seconds).
+    #[serde(default = "default_exchange_rate_poll_interval")]
+    pub exchange_rate_poll_interval: u64,
+    /// API to poll for exchange rates. Currently the supported options are:
+    /// - [CoinCap](https://docs.coincap.io)
+    /// - [CryptoCompare](https://cryptocompare.com) (note this requires an API key)
+    /// If this value is not set, the node will not poll for exchange rates and will
+    /// instead use the rates configured via the HTTP API.
+    pub exchange_rate_provider: Option<ExchangeRateProvider>,
+    // Spread, as a fraction, to add on top of the exchange rate.
+    // This amount is kept as the node operator's profit, or may cover
+    // fluctuations in exchange rates.
+    // For example, take an incoming packet with an amount of 100. If the
+    // exchange rate is 1:2 and the spread is 0.01, the amount on the
+    // outgoing packet would be 198 (instead of 200 without the spread).
+    pub exchange_rate_spread: f64,
 }
 
 impl InterledgerNode {
@@ -130,9 +151,9 @@ impl InterledgerNode {
         );
         let redis_secret = generate_redis_secret(&self.secret_seed);
         let secret_seed = Bytes::from(&self.secret_seed[..]);
-        let btp_address = self.btp_address;
-        let http_address = self.http_address;
-        let settlement_address = self.settlement_address;
+        let btp_bind_address = self.btp_bind_address;
+        let http_bind_address = self.http_bind_address;
+        let settlement_api_bind_address = self.settlement_api_bind_address;
         let ilp_address = self.ilp_address.clone();
         let ilp_address_clone = ilp_address.clone();
         let ilp_address_clone2 = ilp_address.clone();
@@ -140,6 +161,9 @@ impl InterledgerNode {
         let default_spsp_account = self.default_spsp_account.clone();
         let redis_addr = self.redis_connection.addr.clone();
         let route_broadcast_interval = self.route_broadcast_interval;
+        let exchange_rate_provider = self.exchange_rate_provider.clone();
+        let exchange_rate_poll_interval = self.exchange_rate_poll_interval;
+        let exchange_rate_spread = self.exchange_rate_spread;
 
         RedisStoreBuilder::new(self.redis_connection.clone(), redis_secret)
         .connect()
@@ -171,7 +195,7 @@ impl InterledgerNode {
                     // TODO try reconnecting to those accounts later
                     connect_client(ilp_address_clone2.clone(), btp_accounts, false, outgoing_service).and_then(
                         move |btp_client_service| {
-                            create_server(ilp_address_clone2, btp_address, store.clone(), btp_client_service.clone()).and_then(
+                            create_server(ilp_address_clone2, btp_bind_address, store.clone(), btp_client_service.clone()).and_then(
                                 move |btp_server_service| {
                                     // The BTP service is both an Incoming and Outgoing one so we pass it first as the Outgoing
                                     // service to others like the router and then call handle_incoming on it to set up the incoming handler
@@ -201,6 +225,7 @@ impl InterledgerNode {
                                     );
                                     let outgoing_service = ExchangeRateService::new(
                                         ilp_address.clone(),
+                                        exchange_rate_spread,
                                         store.clone(),
                                         outgoing_service,
                                     );
@@ -242,6 +267,7 @@ impl InterledgerNode {
                                     btp_server_service.handle_incoming(incoming_service.clone());
                                     btp_client_service.handle_incoming(incoming_service.clone());
 
+                                    // Node HTTP API
                                     // TODO should this run the node api on a different port so it's easier to separate public/private?
                                     // Note the API also includes receiving ILP packets sent via HTTP
                                     let mut api = NodeApi::new(
@@ -253,19 +279,28 @@ impl InterledgerNode {
                                     if let Some(username) = default_spsp_account {
                                         api.default_spsp_account(username);
                                     }
-                                    let listener = TcpListener::bind(&http_address)
+                                    let listener = TcpListener::bind(&http_bind_address)
                                         .expect("Unable to bind to HTTP address");
-                                    info!("Interledger node listening on: {}", http_address);
-                                    tokio::spawn(api.serve(listener.incoming()));
+                                    info!("Interledger node listening on: {}", http_bind_address);
+                                    spawn(api.serve(listener.incoming()));
 
+                                    // Settlement API
                                     let settlement_api = SettlementApi::new(
                                         store.clone(),
                                         outgoing_service.clone(),
                                     );
-                                    let listener = TcpListener::bind(&settlement_address)
+                                    let listener = TcpListener::bind(&settlement_api_bind_address)
                                         .expect("Unable to bind to Settlement API address");
-                                    info!("Settlement API listening on: {}", settlement_address);
-                                    tokio::spawn(settlement_api.serve(listener.incoming()));
+                                    info!("Settlement API listening on: {}", settlement_api_bind_address);
+                                    spawn(settlement_api.serve(listener.incoming()));
+
+                                    // Exchange Rate Polling
+                                    if let Some(provider) = exchange_rate_provider {
+                                        let exchange_rate_fetcher = ExchangeRateFetcher::new(provider, store.clone());
+                                        exchange_rate_fetcher.spawn_interval(Duration::from_millis(exchange_rate_poll_interval));
+                                    } else {
+                                        debug!("Not using exchange rate provider. Rates must be set via the HTTP API");
+                                    }
 
                                     Ok(())
                                 },
@@ -278,7 +313,7 @@ impl InterledgerNode {
 
     /// Run the node on the default Tokio runtime
     pub fn run(&self) {
-        tokio::run(self.serve());
+        tokio_run(self.serve());
     }
 
     pub fn insert_account(
@@ -293,7 +328,7 @@ impl InterledgerNode {
 pub use interledger_api::AccountDetails;
 #[doc(hidden)]
 pub fn insert_account_redis<R>(
-    redis_uri: R,
+    redis_url: R,
     secret_seed: &[u8; 32],
     account: AccountDetails,
 ) -> impl Future<Item = AccountId, Error = ()>
@@ -301,9 +336,9 @@ where
     R: IntoConnectionInfo,
 {
     let redis_secret = generate_redis_secret(secret_seed);
-    result(redis_uri.into_connection_info())
+    result(redis_url.into_connection_info())
         .map_err(|err| error!("Invalid Redis connection details: {:?}", err))
-        .and_then(move |redis_uri| RedisStoreBuilder::new(redis_uri, redis_secret).connect())
+        .and_then(move |redis_url| RedisStoreBuilder::new(redis_url, redis_secret).connect())
         .map_err(|err| error!("Error connecting to Redis: {:?}", err))
         .and_then(move |store| {
             store

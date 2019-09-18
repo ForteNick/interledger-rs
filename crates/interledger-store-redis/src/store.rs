@@ -16,7 +16,7 @@
 //    hgetall <key>         the flattened list of every key/value entry within a hash
 
 use super::account::*;
-use super::crypto::{generate_keys, DecryptionKey, EncryptionKey};
+use super::crypto::{encrypt_token, generate_keys, DecryptionKey, EncryptionKey};
 use bytes::Bytes;
 use futures::{
     future::{err, ok, result, Either},
@@ -27,9 +27,9 @@ use std::collections::{HashMap, HashSet};
 
 use super::account::AccountId;
 use http::StatusCode;
-use interledger_api::{AccountDetails, NodeStore};
+use interledger_api::{AccountDetails, AccountSettings, NodeStore};
 use interledger_btp::BtpStore;
-use interledger_ccp::RouteManagerStore;
+use interledger_ccp::{CcpRoutingAccount, RouteManagerStore};
 use interledger_http::HttpStore;
 use interledger_router::RouterStore;
 use interledger_service::{Account as AccountTrait, AccountStore, Username};
@@ -168,7 +168,6 @@ lazy_static! {
 }
 
 static ROUTES_KEY: &str = "routes:current";
-static RATES_KEY: &str = "rates:current";
 static STATIC_ROUTES_KEY: &str = "routes:static";
 
 fn prefixed_idempotency_key(idempotency_key: String) -> String {
@@ -180,15 +179,15 @@ fn accounts_key(account_id: AccountId) -> String {
 }
 
 pub struct RedisStoreBuilder {
-    redis_uri: ConnectionInfo,
+    redis_url: ConnectionInfo,
     secret: [u8; 32],
     poll_interval: u64,
 }
 
 impl RedisStoreBuilder {
-    pub fn new(redis_uri: ConnectionInfo, secret: [u8; 32]) -> Self {
+    pub fn new(redis_url: ConnectionInfo, secret: [u8; 32]) -> Self {
         RedisStoreBuilder {
-            redis_uri,
+            redis_url,
             secret,
             poll_interval: DEFAULT_POLL_INTERVAL,
         }
@@ -204,7 +203,7 @@ impl RedisStoreBuilder {
         self.secret.zeroize(); // clear the secret after it has been used for key generation
         let poll_interval = self.poll_interval;
 
-        result(Client::open(self.redis_uri.clone()))
+        result(Client::open(self.redis_url.clone()))
             .map_err(|err| error!("Error creating Redis client: {:?}", err))
             .and_then(|client| {
                 debug!("Connected to redis: {:?}", client);
@@ -220,27 +219,6 @@ impl RedisStoreBuilder {
                     encryption_key: Arc::new(encryption_key),
                     decryption_key: Arc::new(decryption_key),
                 };
-
-                // Start polling for rate updates
-                // Note: if this behavior changes, make sure to update the Drop implementation
-                let connection_clone = Arc::downgrade(&store.connection);
-                let exchange_rates = store.exchange_rates.clone();
-                let poll_rates =
-                    Interval::new(Instant::now(), Duration::from_millis(poll_interval))
-                        .map_err(|err| error!("Interval error: {:?}", err))
-                        .for_each(move |_| {
-                            if let Some(connection) = connection_clone.upgrade() {
-                                Either::A(update_rates(
-                                    connection.as_ref().clone(),
-                                    exchange_rates.clone(),
-                                ))
-                            } else {
-                                debug!("Not polling rates anymore because connection was closed");
-                                // TODO make sure the interval stops
-                                Either::B(err(()))
-                            }
-                        });
-                spawn(poll_rates);
 
                 // Poll for routing table updates
                 // Note: if this behavior changes, make sure to update the Drop implementation
@@ -342,11 +320,11 @@ impl RedisStore {
                     // Set balance-related details
                     pipe.hset_multiple(accounts_key(account.id), &[("balance", 0), ("prepaid_amount", 0)]).ignore();
 
-                    if account.send_routes {
+                    if account.should_send_routes() {
                         pipe.sadd("send_routes_to", account.id).ignore();
                     }
 
-                    if account.receive_routes {
+                    if account.should_receive_routes() {
                         pipe.sadd("receive_routes_from", account.id).ignore();
                     }
 
@@ -416,11 +394,11 @@ impl RedisStore {
                         )
                         .ignore();
 
-                    if account.send_routes {
+                    if account.should_send_routes() {
                         pipe.sadd("send_routes_to", account.id).ignore();
                     }
 
-                    if account.receive_routes {
+                    if account.should_receive_routes() {
                         pipe.sadd("receive_routes_from", account.id).ignore();
                     }
 
@@ -454,6 +432,86 @@ impl RedisStore {
         )
     }
 
+    fn redis_modify_account(
+        &self,
+        id: AccountId,
+        settings: AccountSettings,
+    ) -> Box<dyn Future<Item = Account, Error = ()> + Send> {
+        let connection = self.connection.clone();
+        let encryption_key = self.encryption_key.clone();
+        let self_clone = self.clone();
+
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+
+        if let Some(ref endpoint) = settings.btp_uri {
+            pipe.hset(accounts_key(id), "btp_uri", endpoint);
+        }
+
+        if let Some(ref endpoint) = settings.http_endpoint {
+            pipe.hset(accounts_key(id), "http_endpoint", endpoint);
+        }
+
+        if let Some(ref token) = settings.btp_outgoing_token {
+            pipe.hset(
+                accounts_key(id),
+                "btp_outgoing_token",
+                encrypt_token(&encryption_key.expose_secret().0, token.as_ref()).as_ref(),
+            );
+        }
+
+        if let Some(ref token) = settings.http_outgoing_token {
+            pipe.hset(
+                accounts_key(id),
+                "http_outgoing_token",
+                encrypt_token(&encryption_key.expose_secret().0, token.as_ref()).as_ref(),
+            );
+        }
+
+        if let Some(ref token) = settings.btp_incoming_token {
+            pipe.hset(
+                accounts_key(id),
+                "btp_incoming_token",
+                encrypt_token(&encryption_key.expose_secret().0, token.as_ref()).as_ref(),
+            );
+        }
+
+        if let Some(ref token) = settings.http_incoming_token {
+            pipe.hset(
+                accounts_key(id),
+                "http_incoming_token",
+                encrypt_token(&encryption_key.expose_secret().0, token.as_ref()).as_ref(),
+            );
+        }
+
+        if let Some(settle_threshold) = settings.settle_threshold {
+            pipe.hset(accounts_key(id), "settle_threshold", settle_threshold);
+        }
+
+        if let Some(settle_to) = settings.settle_to {
+            pipe.hset(accounts_key(id), "settle_to", settle_to);
+        }
+
+        Box::new(
+            pipe.query_async(connection.as_ref().clone())
+                .map_err(|err| error!("Error modifying user account: {:?}", err))
+                .and_then(move |(_connection, _ret): (SharedConnection, Value)| {
+                    // return the updated account
+                    self_clone.redis_get_account(id)
+                }),
+        )
+    }
+
+    fn redis_get_account(
+        &self,
+        id: AccountId,
+    ) -> Box<dyn Future<Item = Account, Error = ()> + Send> {
+        Box::new(
+            self.redis_get_accounts(vec![id])
+                .and_then(|accounts| accounts.get(0).cloned().ok_or(())),
+        )
+    }
+
     fn redis_delete_account(
         &self,
         id: AccountId,
@@ -461,45 +519,40 @@ impl RedisStore {
         let connection = self.connection.as_ref().clone();
         let routing_table = self.routes.clone();
 
-        Box::new(
-            // TODO: a get_account API to avoid making Vecs which we only need one element of
-            self.redis_get_accounts(vec![id])
-                .and_then(|accounts| accounts.get(0).cloned().ok_or(()))
-                .and_then(|account| {
-                    let mut pipe = redis::pipe();
-                    pipe.atomic();
+        Box::new(self.redis_get_account(id).and_then(|account| {
+            let mut pipe = redis::pipe();
+            pipe.atomic();
 
-                    pipe.srem("accounts", account.id).ignore();
+            pipe.srem("accounts", account.id).ignore();
 
-                    pipe.del(accounts_key(account.id)).ignore();
-                    pipe.hdel("usernames", account.username().as_ref()).ignore();
+            pipe.del(accounts_key(account.id)).ignore();
+            pipe.hdel("usernames", account.username().as_ref()).ignore();
 
-                    if account.send_routes {
-                        pipe.srem("send_routes_to", account.id).ignore();
-                    }
+            if account.should_send_routes() {
+                pipe.srem("send_routes_to", account.id).ignore();
+            }
 
-                    if account.receive_routes {
-                        pipe.srem("receive_routes_from", account.id).ignore();
-                    }
+            if account.should_receive_routes() {
+                pipe.srem("receive_routes_from", account.id).ignore();
+            }
 
-                    if account.btp_uri.is_some() {
-                        pipe.srem("btp_outgoing", account.id).ignore();
-                    }
+            if account.btp_uri.is_some() {
+                pipe.srem("btp_outgoing", account.id).ignore();
+            }
 
-                    pipe.hdel(ROUTES_KEY, account.ilp_address.to_bytes().to_vec())
-                        .ignore();
+            pipe.hdel(ROUTES_KEY, account.ilp_address.to_bytes().to_vec())
+                .ignore();
 
-                    pipe.query_async(connection)
-                        .map_err(|err| error!("Error deleting account from DB: {:?}", err))
-                        .and_then(move |(connection, _ret): (SharedConnection, Value)| {
-                            update_routes(connection, routing_table)
-                        })
-                        .and_then(move |_| {
-                            debug!("Deleted account {}", account.id);
-                            Ok(account)
-                        })
-                }),
-        )
+            pipe.query_async(connection)
+                .map_err(|err| error!("Error deleting account from DB: {:?}", err))
+                .and_then(move |(connection, _ret): (SharedConnection, Value)| {
+                    update_routes(connection, routing_table)
+                })
+                .and_then(move |_| {
+                    debug!("Deleted account {}", account.id);
+                    Ok(account)
+                })
+        }))
     }
 
     fn redis_get_accounts(
@@ -704,6 +757,16 @@ impl ExchangeRateStore for RedisStore {
             Err(())
         }
     }
+
+    fn get_all_exchange_rates(&self) -> Result<HashMap<String, f64>, ()> {
+        Ok((*self.exchange_rates.read()).clone())
+    }
+
+    fn set_exchange_rates(&self, rates: HashMap<String, f64>) -> Result<(), ()> {
+        // TODO publish rate updates through a pubsub mechanism to support horizontally scaling nodes
+        (*self.exchange_rates.write()) = rates;
+        Ok(())
+    }
 }
 
 impl BtpStore for RedisStore {
@@ -867,6 +930,14 @@ impl NodeStore for RedisStore {
         self.redis_update_account(id, account)
     }
 
+    fn modify_account_settings(
+        &self,
+        id: <Self::Account as AccountTrait>::AccountId,
+        settings: AccountSettings,
+    ) -> Box<dyn Future<Item = Self::Account, Error = ()> + Send> {
+        self.redis_modify_account(id, settings)
+    }
+
     // TODO limit the number of results and page through them
     fn get_all_accounts(&self) -> Box<dyn Future<Item = Vec<Self::Account>, Error = ()> + Send> {
         let decryption_key = self.decryption_key.clone();
@@ -894,28 +965,6 @@ impl NodeStore for RedisStore {
                     },
                 )
         }))
-    }
-
-    fn set_rates<R>(&self, rates: R) -> Box<dyn Future<Item = (), Error = ()> + Send>
-    where
-        R: IntoIterator<Item = (String, f64)>,
-    {
-        let rates: Vec<(String, f64)> = rates.into_iter().collect();
-        let exchange_rates = self.exchange_rates.clone();
-        let mut pipe = redis::pipe();
-        pipe.atomic()
-            .del(RATES_KEY)
-            .ignore()
-            .hset_multiple(RATES_KEY, &rates)
-            .ignore();
-        Box::new(
-            pipe.query_async(self.connection.as_ref().clone())
-                .map_err(|err| error!("Error setting rates: {:?}", err))
-                .and_then(move |(connection, _): (SharedConnection, Value)| {
-                    trace!("Set exchange rates: {:?}", exchange_rates);
-                    update_rates(connection, exchange_rates)
-                }),
-        )
     }
 
     // TODO fix inconsistency betwen this method and set_routes which
@@ -1393,27 +1442,9 @@ impl SettlementStore for RedisStore {
     }
 }
 
-// TODO replace this with pubsub when async pubsub is added upstream: https://github.com/mitsuhiko/redis-rs/issues/183
-fn update_rates(
-    connection: SharedConnection,
-    exchange_rates: Arc<RwLock<HashMap<String, f64>>>,
-) -> impl Future<Item = (), Error = ()> {
-    cmd("HGETALL")
-        .arg(RATES_KEY)
-        .query_async(connection)
-        .map_err(|err| error!("Error polling for exchange rates: {:?}", err))
-        .and_then(move |(_connection, rates): (_, Vec<(String, f64)>)| {
-            let num_assets = rates.len();
-            let rates = HashMap::from_iter(rates.into_iter());
-            (*exchange_rates.write()) = rates;
-            trace!("Updated rates for {} assets", num_assets);
-            Ok(())
-        })
-}
-
-// TODO replace this with pubsub when async pubsub is added upstream: https://github.com/mitsuhiko/redis-rs/issues/183
 type RouteVec = Vec<(String, AccountId)>;
 
+// TODO replace this with pubsub when async pubsub is added upstream: https://github.com/mitsuhiko/redis-rs/issues/183
 fn update_routes(
     connection: SharedConnection,
     routing_table: Arc<RwLock<HashMap<Bytes, AccountId>>>,

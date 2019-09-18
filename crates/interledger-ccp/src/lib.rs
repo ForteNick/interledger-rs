@@ -28,11 +28,20 @@ pub use server::{CcpRouteManager, CcpRouteManagerBuilder};
 
 use serde::{Deserialize, Serialize};
 
+/// Data structure used to describe the routing relation of an account with its peers.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum RoutingRelation {
+    /// An account from which we do not receive routes from, neither broadcast
+    /// routes to
+    NonRoutingAccount = 0,
+    /// An account from which we receive routes from, but do not broadcast
+    /// routes to
     Parent = 1,
+    /// An account from which we receive routes from and broadcast routes to
     Peer = 2,
+    /// An account from which we do not receive routes from, but broadcast
+    /// routes to
     Child = 3,
 }
 
@@ -41,6 +50,7 @@ impl FromStr for RoutingRelation {
 
     fn from_str(string: &str) -> Result<Self, ()> {
         match string.to_lowercase().as_str() {
+            "nonroutingaccount" => Ok(RoutingRelation::NonRoutingAccount),
             "parent" => Ok(RoutingRelation::Parent),
             "peer" => Ok(RoutingRelation::Peer),
             "child" => Ok(RoutingRelation::Child),
@@ -52,6 +62,7 @@ impl FromStr for RoutingRelation {
 impl ToString for RoutingRelation {
     fn to_string(&self) -> String {
         match self {
+            RoutingRelation::NonRoutingAccount => "NonRoutingAccount".to_string(),
             RoutingRelation::Parent => "Parent".to_string(),
             RoutingRelation::Peer => "Peer".to_string(),
             RoutingRelation::Child => "Child".to_string(),
@@ -66,12 +77,14 @@ pub trait CcpRoutingAccount: Account + IldcpAccount {
 
     /// Indicates whether we should send CCP Route Updates to this account
     fn should_send_routes(&self) -> bool {
-        false
+        self.routing_relation() == RoutingRelation::Child
+            || self.routing_relation() == RoutingRelation::Peer
     }
 
     /// Indicates whether we should accept CCP Route Update Requests from this account
     fn should_receive_routes(&self) -> bool {
-        false
+        self.routing_relation() == RoutingRelation::Parent
+            || self.routing_relation() == RoutingRelation::Peer
     }
 }
 

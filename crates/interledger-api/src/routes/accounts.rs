@@ -1,4 +1,5 @@
-use crate::{AccountDetails, NodeStore, BEARER_TOKEN_START};
+use crate::client::Client;
+use crate::{AccountDetails, AccountSettings, NodeStore, BEARER_TOKEN_START};
 use futures::{
     future::{err, ok, result, Either},
     Future,
@@ -8,11 +9,10 @@ use interledger_http::{HttpAccount, HttpStore};
 use interledger_service::{Account, AuthToken, Username};
 use interledger_service_util::BalanceStore;
 use log::{debug, error, trace};
-use reqwest::r#async::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::str::FromStr;
-use tokio_retry::{strategy::FixedInterval, Retry};
+use std::time::Duration;
 use tower_web::{impl_web, Response};
 use url::Url;
 
@@ -94,34 +94,22 @@ impl_web! {
                         let id = account.id();
                         Either::A(result(Url::parse(&se_url))
                         .map_err(|_| Response::error(500))
-                        .and_then(move |mut se_url| {
-                            se_url
-                                .path_segments_mut()
-                                .expect("Invalid settlement engine URL")
-                                .push("accounts");
+                        .and_then(move |se_url| {
+                            let client = Client::new(Duration::from_millis(5000), MAX_RETRIES);
                             trace!(
                                 "Sending account {} creation request to settlement engine: {:?}",
                                 id,
                                 se_url.clone()
                             );
-                            let action = move || {
-                                Client::new().post(se_url.as_ref())
-                                .json(&json!({"id" : id.to_string()}))
-                                .send()
-                                .map_err(move |err| {
-                                    error!("Error sending account creation command to the settlement engine: {:?}", err)
-                                })
-                                .and_then(move |response| {
-                                    if response.status().is_success() {
-                                        trace!("Account {} created on the SE", id);
-                                        Ok(())
-                                    } else {
-                                        error!("Error creating account. Settlement engine responded with HTTP code: {}", response.status());
-                                        Err(())
-                                    }
-                                })
-                            };
-                            Retry::spawn(FixedInterval::from_millis(2000).take(MAX_RETRIES), action)
+                            client.create_engine_account(se_url, id)
+                            .and_then(move |status_code| {
+                                if status_code.is_success() {
+                                    trace!("Account {} created on the SE", id);
+                                } else {
+                                    error!("Error creating account. Settlement engine responded with HTTP code: {}", status_code);
+                                }
+                                Ok(())
+                            })
                             .map_err(|_| Response::error(500))
                             .and_then(move |_| {
                                 Ok(json!(account))
@@ -215,6 +203,41 @@ impl_web! {
                 }
             })
             })
+        }
+
+        #[put("/accounts/:username/settings")]
+        #[content_type("application/json")]
+        fn http_edit_account(&self, username: String, body: AccountSettings, authorization: String) -> impl Future<Item = Value, Error = Response<()>> {
+            let store = self.store.clone();
+            let auth_clone = authorization.clone();
+            let username = match Username::from_str(&username) {
+                Ok(username) => username,
+                Err(_) => {
+                    error!("Invalid username: {}", username);
+                    return Either::A(err(Response::error(500)))
+                }
+            };
+            let auth = match AuthToken::from_str(&authorization) {
+                Ok(auth) => auth,
+                Err(_) => {
+                    error!("Could not parse auth token {:?}", auth_clone);
+                    return Either::A(err(Response::error(401)))
+                }
+            };
+
+            Either::B(store.get_account_from_http_auth(&username, &auth.password())
+            .map_err(move |_| {
+                debug!("No account found with auth: {}", authorization);
+                Response::error(401)
+            })
+            .and_then(move |acc| {
+                store.modify_account_settings(acc.id(), body)
+                .map_err(move |_| {
+                    debug!("Could not modify account settings");
+                    Response::error(401)
+                })
+                .and_then(move |account| Ok(json!(account)))
+            }))
         }
 
         #[delete("/accounts/:username")]
