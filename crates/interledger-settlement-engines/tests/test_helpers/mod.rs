@@ -1,5 +1,4 @@
 use futures::{stream::Stream, Future};
-use interledger_ildcp::IldcpAccount;
 use interledger_packet::Address;
 use interledger_service::Account as AccountTrait;
 #[cfg(feature = "ethereum")]
@@ -115,6 +114,27 @@ pub fn create_account_on_engine<T: Serialize>(
 }
 
 #[allow(unused)]
+pub fn create_account_on_node<T: Serialize>(
+    api_port: u16,
+    data: T,
+    auth: &str,
+) -> impl Future<Item = String, Error = ()> {
+    let client = reqwest::r#async::Client::new();
+    client
+        .post(&format!("http://localhost:{}/accounts", api_port))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", auth))
+        .json(&data)
+        .send()
+        .and_then(move |res| res.error_for_status())
+        .and_then(move |res| res.into_body().concat2())
+        .map_err(|err| {
+            eprintln!("Error creating account on node: {:?}", err);
+        })
+        .and_then(move |chunk| Ok(str::from_utf8(&chunk).unwrap().to_string()))
+}
+
+#[allow(unused)]
 pub fn send_money_to_username<T: Display + Debug>(
     from_port: u16,
     to_port: u16,
@@ -126,10 +146,13 @@ pub fn send_money_to_username<T: Display + Debug>(
     let client = reqwest::r#async::Client::new();
     let auth = format!("{}:{}", from_username, from_auth);
     client
-        .post(&format!("http://localhost:{}/pay", from_port))
+        .post(&format!(
+            "http://localhost:{}/accounts/{}/payments",
+            from_port, from_username
+        ))
         .header("Authorization", format!("Bearer {}", auth))
         .json(&json!({
-            "receiver": format!("http://localhost:{}/spsp/{}", to_port, to_username),
+            "receiver": format!("http://localhost:{}/accounts/{}/spsp", to_port, to_username),
             "source_amount": amount,
         }))
         .send()
@@ -169,7 +192,7 @@ pub fn get_all_accounts(
 pub fn accounts_to_ids(accounts: Vec<Account>) -> HashMap<Address, AccountId> {
     let mut map = HashMap::new();
     for a in accounts {
-        map.insert(a.client_address().clone(), a.id());
+        map.insert(a.ilp_address().clone(), a.id());
     }
     map
 }

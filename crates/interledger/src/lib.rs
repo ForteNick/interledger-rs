@@ -3,22 +3,12 @@
 //! A CLI and library bundle for the Rust implementation of the Interledger Protocol stack.
 #![recursion_limit = "128"]
 
-#[cfg(feature = "cli")]
-/// ILP Packet (De)Serialization
-pub mod packet {
-    pub use interledger_packet::*;
-}
+pub mod node;
 
 /// The core abstractions used by Interledger.rs: IncomingService and OutgoingService
 pub mod service {
     pub use interledger_service::*;
 }
-
-#[doc(hidden)]
-#[cfg(feature = "cli")]
-pub mod cli;
-#[cfg(feature = "cli")]
-pub mod node;
 
 /// Bilateral Transport Protocol (BTP) client and server
 #[cfg(feature = "btp")]
@@ -70,30 +60,6 @@ pub mod stream {
     pub use interledger_stream::*;
 }
 
-/// In-memory data store
-#[cfg(feature = "store-memory")]
-pub mod store_memory {
-    //! # interledger-store-memory
-    //!
-    //! A simple in-memory store intended primarily for testing and
-    //! stateless sender/receiver services that are passed all of the
-    //! relevant account details when the store is instantiated.
-    pub use interledger_store_memory::*;
-}
-
-#[cfg(feature = "store-redis")]
-pub mod store_redis {
-    //! # interledger-store-redis
-    //!
-    //! A simple redis server store for persisting account details.
-    pub use interledger_store_redis::*;
-}
-
-#[cfg(feature = "api")]
-pub mod api {
-    pub use interledger_api::*;
-}
-
 /// Interledger Dynamic Configuration Protocol (ILDCP)
 #[cfg(feature = "ildcp")]
 pub mod ildcp {
@@ -139,25 +105,5 @@ pub mod spsp {
 /// Miscellaneous services
 #[cfg(feature = "service-util")]
 pub mod service_util {
-    //! # interledger-service-util
-    //!
-    //! Implementations of miscellaneous utility services.
     pub use interledger_service_util::*;
-}
-
-#[cfg(feature = "settlement")]
-pub mod settlement {
-    //! # interledger-settlement
-    //!
-    //! Implements the settlement business logic
-    pub use interledger_settlement::*;
-}
-
-#[cfg(feature = "settlement-engines")]
-pub mod settlement_engines {
-    //! # interledger-settlement-engines
-    //!
-    //! Service to expose the Settlement API via HTTPS. Provides an interface for plugging in arbitrary settlement
-    //! engines.
-    pub use interledger_settlement_engines::*;
 }

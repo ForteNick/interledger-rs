@@ -2,17 +2,19 @@ use super::crypto::*;
 use super::packet::*;
 use base64;
 use bytes::Bytes;
-use futures::future::result;
+use chrono::{DateTime, Utc};
+use futures::{future::result, sync::mpsc::UnboundedSender, Future};
 use hex;
-use interledger_ildcp::IldcpAccount;
 use interledger_packet::{
     Address, ErrorCode, Fulfill, FulfillBuilder, PacketType as IlpPacketType, Prepare, Reject,
     RejectBuilder,
 };
-use interledger_service::{Account, BoxedIlpFuture, OutgoingRequest, OutgoingService};
+use interledger_service::{Account, BoxedIlpFuture, OutgoingRequest, OutgoingService, Username};
 use log::debug;
+use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 use std::marker::PhantomData;
+use std::time::SystemTime;
 
 const STREAM_SERVER_SECRET_GENERATOR: &[u8] = b"ilp_stream_secret_generator";
 
@@ -85,6 +87,28 @@ impl ConnectionGenerator {
     }
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct PaymentNotification {
+    pub to_username: Username,
+    pub from_username: Username,
+    pub destination: Address,
+    pub amount: u64,
+    pub timestamp: String,
+}
+
+/// A trait representing the Publish side of a pub/sub store
+pub trait StreamNotificationsStore {
+    type Account: Account;
+
+    fn add_payment_notification_subscription(
+        &self,
+        account_id: <Self::Account as Account>::AccountId,
+        sender: UnboundedSender<PaymentNotification>,
+    );
+
+    fn publish_payment_notification(&self, _payment: PaymentNotification);
+}
+
 /// An OutgoingService that fulfills incoming STREAM packets.
 ///
 /// Note this does **not** maintain STREAM state, but instead fulfills
@@ -92,32 +116,35 @@ impl ConnectionGenerator {
 ///
 /// This does not currently support handling data sent via STREAM.
 #[derive(Clone)]
-pub struct StreamReceiverService<O: OutgoingService<A>, A: Account> {
+pub struct StreamReceiverService<S, O: OutgoingService<A>, A: Account> {
     connection_generator: ConnectionGenerator,
     next: O,
     account_type: PhantomData<A>,
+    store: S,
 }
 
-impl<O, A> StreamReceiverService<O, A>
+impl<S, O, A> StreamReceiverService<S, O, A>
 where
+    S: StreamNotificationsStore<Account = A>,
     O: OutgoingService<A>,
     A: Account,
 {
-    pub fn new(server_secret: Bytes, next: O) -> Self {
+    pub fn new(server_secret: Bytes, store: S, next: O) -> Self {
         let connection_generator = ConnectionGenerator::new(server_secret);
         StreamReceiverService {
             connection_generator,
             next,
             account_type: PhantomData,
+            store,
         }
     }
 }
 
-// TODO should this be an OutgoingService instead so the balance logic is applied before this is called?
-impl<O, A> OutgoingService<A> for StreamReceiverService<O, A>
+impl<S, O, A> OutgoingService<A> for StreamReceiverService<S, O, A>
 where
+    S: StreamNotificationsStore + Send + Sync + 'static + Clone,
     O: OutgoingService<A>,
-    A: Account + IldcpAccount,
+    A: Account,
 {
     type Future = BoxedIlpFuture;
 
@@ -128,14 +155,32 @@ where
     /// the server to check whether the Prepare packet was created with STREAM parameters
     /// that this server would have created or not.
     fn send_request(&mut self, request: OutgoingRequest<A>) -> Self::Future {
+        let to_username = request.to.username().clone();
+        let from_username = request.from.username().clone();
+        let amount = request.prepare.amount();
+        let store = self.store.clone();
+
         let destination = request.prepare.destination();
-        let to = request.to.client_address();
+        let to_address = request.to.ilp_address();
         let dest: &[u8] = destination.as_ref();
-        if dest.starts_with(to.as_ref()) {
+
+        // The case where the request is bound for this server
+        if dest.starts_with(to_address.as_ref()) {
             if let Ok(shared_secret) = self.connection_generator.rederive_secret(&destination) {
-                {
-                    return Box::new(result(receive_money(&shared_secret, &to, request.prepare)));
-                }
+                return Box::new(
+                    result(receive_money(&shared_secret, &to_address, request.prepare)).and_then(
+                        move |fulfill| {
+                            store.publish_payment_notification(PaymentNotification {
+                                to_username,
+                                from_username,
+                                amount,
+                                destination: destination.clone(),
+                                timestamp: DateTime::<Utc>::from(SystemTime::now()).to_rfc3339(),
+                            });
+                            Ok(fulfill)
+                        },
+                    ),
+                );
             }
         }
         Box::new(self.next.send_request(request))
@@ -145,7 +190,7 @@ where
 // TODO send asset code and scale back to sender also
 fn receive_money(
     shared_secret: &[u8; 32],
-    client_address: &Address,
+    ilp_address: &Address,
     prepare: Prepare,
 ) -> Result<Fulfill, Reject> {
     // Generate fulfillment
@@ -162,7 +207,7 @@ fn receive_money(
             RejectBuilder {
                 code: ErrorCode::F06_UNEXPECTED_PAYMENT,
                 message: b"Could not decrypt data",
-                triggered_by: Some(client_address),
+                triggered_by: Some(ilp_address),
                 data: &[],
             }
             .build()
@@ -230,7 +275,7 @@ fn receive_money(
         let reject = RejectBuilder {
             code: ErrorCode::F99_APPLICATION_ERROR,
             message: &[],
-            triggered_by: Some(&client_address),
+            triggered_by: Some(&ilp_address),
             data: &encrypted_response[..],
         }
         .build();
@@ -302,11 +347,11 @@ mod receiving_money {
     use std::time::UNIX_EPOCH;
     #[test]
     fn fulfills_valid_packet() {
-        let client_address = Address::from_str("example.destination").unwrap();
+        let ilp_address = Address::from_str("example.destination").unwrap();
         let server_secret = Bytes::from(&[1; 32][..]);
         let connection_generator = ConnectionGenerator::new(server_secret.clone());
         let (destination_account, shared_secret) =
-            connection_generator.generate_address_and_secret(&client_address);
+            connection_generator.generate_address_and_secret(&ilp_address);
         let stream_packet = test_stream_packet();
         let data = stream_packet.into_encrypted(&shared_secret[..]);
         let execution_condition = generate_condition(&shared_secret[..], &data);
@@ -324,17 +369,17 @@ mod receiving_money {
         let shared_secret = connection_generator
             .rederive_secret(&prepare.destination())
             .unwrap();
-        let result = receive_money(&shared_secret, &client_address, prepare);
+        let result = receive_money(&shared_secret, &ilp_address, prepare);
         assert!(result.is_ok());
     }
 
     #[test]
     fn fulfills_valid_packet_without_connection_tag() {
-        let client_address = Address::from_str("example.destination").unwrap();
+        let ilp_address = Address::from_str("example.destination").unwrap();
         let server_secret = Bytes::from(&[1; 32][..]);
         let connection_generator = ConnectionGenerator::new(server_secret.clone());
         let (destination_account, shared_secret) =
-            connection_generator.generate_address_and_secret(&client_address);
+            connection_generator.generate_address_and_secret(&ilp_address);
         let stream_packet = test_stream_packet();
         let data = stream_packet.into_encrypted(&shared_secret[..]);
         let execution_condition = generate_condition(&shared_secret[..], &data);
@@ -352,17 +397,17 @@ mod receiving_money {
         let shared_secret = connection_generator
             .rederive_secret(&prepare.destination())
             .unwrap();
-        let result = receive_money(&shared_secret, &client_address, prepare);
+        let result = receive_money(&shared_secret, &ilp_address, prepare);
         assert!(result.is_ok());
     }
 
     #[test]
     fn rejects_modified_data() {
-        let client_address = Address::from_str("example.destination").unwrap();
+        let ilp_address = Address::from_str("example.destination").unwrap();
         let server_secret = Bytes::from(&[1; 32][..]);
         let connection_generator = ConnectionGenerator::new(server_secret.clone());
         let (destination_account, shared_secret) =
-            connection_generator.generate_address_and_secret(&client_address);
+            connection_generator.generate_address_and_secret(&ilp_address);
         let stream_packet = test_stream_packet();
         let mut data = stream_packet.into_encrypted(&shared_secret[..]);
         data.extend_from_slice(b"x");
@@ -381,17 +426,17 @@ mod receiving_money {
         let shared_secret = connection_generator
             .rederive_secret(&prepare.destination())
             .unwrap();
-        let result = receive_money(&shared_secret, &client_address, prepare);
+        let result = receive_money(&shared_secret, &ilp_address, prepare);
         assert!(result.is_err());
     }
 
     #[test]
     fn rejects_too_little_money() {
-        let client_address = Address::from_str("example.destination").unwrap();
+        let ilp_address = Address::from_str("example.destination").unwrap();
         let server_secret = Bytes::from(&[1; 32][..]);
         let connection_generator = ConnectionGenerator::new(server_secret.clone());
         let (destination_account, shared_secret) =
-            connection_generator.generate_address_and_secret(&client_address);
+            connection_generator.generate_address_and_secret(&ilp_address);
 
         let stream_packet = StreamPacketBuilder {
             ilp_packet_type: IlpPacketType::Prepare,
@@ -420,7 +465,7 @@ mod receiving_money {
         let shared_secret = connection_generator
             .rederive_secret(&prepare.destination())
             .unwrap();
-        let result = receive_money(&shared_secret, &client_address, prepare);
+        let result = receive_money(&shared_secret, &ilp_address, prepare);
         assert!(result.is_err());
     }
 }
@@ -437,11 +482,11 @@ mod stream_receiver_service {
     use std::time::UNIX_EPOCH;
     #[test]
     fn fulfills_correct_packets() {
-        let client_address = Address::from_str("example.destination").unwrap();
+        let ilp_address = Address::from_str("example.destination").unwrap();
         let server_secret = Bytes::from(&[1; 32][..]);
         let connection_generator = ConnectionGenerator::new(server_secret.clone());
         let (destination_account, shared_secret) =
-            connection_generator.generate_address_and_secret(&client_address);
+            connection_generator.generate_address_and_secret(&ilp_address);
         let stream_packet = test_stream_packet();
         let data = stream_packet.into_encrypted(&shared_secret[..]);
         let execution_condition = generate_condition(&shared_secret[..], &data);
@@ -458,6 +503,7 @@ mod stream_receiver_service {
 
         let mut service = StreamReceiverService::new(
             server_secret.clone(),
+            DummyStore,
             outgoing_service_fn(|_: OutgoingRequest<TestAccount>| -> BoxedIlpFuture {
                 panic!("shouldn't get here")
             }),
@@ -473,7 +519,7 @@ mod stream_receiver_service {
                 },
                 to: TestAccount {
                     id: 1,
-                    ilp_address: client_address.clone(),
+                    ilp_address: ilp_address.clone(),
                     asset_code: "XYZ".to_string(),
                     asset_scale: 9,
                 },
@@ -486,11 +532,11 @@ mod stream_receiver_service {
 
     #[test]
     fn rejects_invalid_packets() {
-        let client_address = Address::from_str("example.destination").unwrap();
+        let ilp_address = Address::from_str("example.destination").unwrap();
         let server_secret = Bytes::from(&[1; 32][..]);
         let connection_generator = ConnectionGenerator::new(server_secret.clone());
         let (destination_account, shared_secret) =
-            connection_generator.generate_address_and_secret(&client_address);
+            connection_generator.generate_address_and_secret(&ilp_address);
         let stream_packet = test_stream_packet();
         let mut data = stream_packet.into_encrypted(&shared_secret[..]);
         let execution_condition = generate_condition(&shared_secret[..], &data);
@@ -509,6 +555,7 @@ mod stream_receiver_service {
 
         let mut service = StreamReceiverService::new(
             server_secret.clone(),
+            DummyStore,
             outgoing_service_fn(|_: OutgoingRequest<TestAccount>| -> BoxedIlpFuture {
                 panic!("shouldn't get here")
             }),
@@ -524,7 +571,7 @@ mod stream_receiver_service {
                 },
                 to: TestAccount {
                     id: 1,
-                    ilp_address: client_address.clone(),
+                    ilp_address: ilp_address.clone(),
                     asset_code: "XYZ".to_string(),
                     asset_scale: 9,
                 },
@@ -537,11 +584,11 @@ mod stream_receiver_service {
 
     #[test]
     fn passes_on_packets_not_for_it() {
-        let client_address = Address::from_str("example.destination").unwrap();
+        let ilp_address = Address::from_str("example.destination").unwrap();
         let server_secret = Bytes::from(&[1; 32][..]);
         let connection_generator = ConnectionGenerator::new(server_secret.clone());
         let (destination_account, shared_secret) =
-            connection_generator.generate_address_and_secret(&client_address);
+            connection_generator.generate_address_and_secret(&ilp_address);
         let stream_packet = test_stream_packet();
         let data = stream_packet.into_encrypted(&shared_secret[..]);
         let execution_condition = generate_condition(&shared_secret[..], &data);
@@ -560,6 +607,7 @@ mod stream_receiver_service {
 
         let mut service = StreamReceiverService::new(
             server_secret.clone(),
+            DummyStore,
             outgoing_service_fn(|_| {
                 Err(RejectBuilder {
                     code: ErrorCode::F02_UNREACHABLE,
@@ -582,7 +630,7 @@ mod stream_receiver_service {
                 original_amount: prepare.amount(),
                 to: TestAccount {
                     id: 1,
-                    ilp_address: client_address.clone(),
+                    ilp_address: ilp_address.clone(),
                     asset_code: "XYZ".to_string(),
                     asset_scale: 9,
                 },

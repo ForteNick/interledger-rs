@@ -1,9 +1,5 @@
 mod accounts;
-mod ilp;
-mod settings;
-mod spsp;
+mod node_settings;
 
-pub use accounts::AccountsApi;
-pub use ilp::IlpApi;
-pub use settings::SettingsApi;
-pub use spsp::SpspApi;
+pub use accounts::accounts_api;
+pub use node_settings::node_settings_api;

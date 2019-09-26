@@ -8,8 +8,8 @@ use interledger_service::{AccountStore, Username};
 use interledger_service_util::BalanceStore;
 use std::str::FromStr;
 
-use interledger_service::Account as AccountTrait;
-use interledger_store_redis::{Account, AccountId};
+use interledger_service::{Account as AccountTrait, AddressStore};
+use interledger_store_redis::AccountId;
 
 #[test]
 fn get_balance() {
@@ -28,8 +28,12 @@ fn get_balance() {
                     .query_async(connection)
                     .map_err(|err| panic!(err))
                     .and_then(move |(_, _): (_, redis::Value)| {
-                        let account =
-                            Account::try_from(account_id, ACCOUNT_DETAILS_0.clone()).unwrap();
+                        let account = Account::try_from(
+                            account_id,
+                            ACCOUNT_DETAILS_0.clone(),
+                            store.get_ilp_address(),
+                        )
+                        .unwrap();
                         store.get_balance(account).and_then(move |balance| {
                             assert_eq!(balance, 1000);
                             let _ = context;
@@ -95,10 +99,10 @@ fn process_fulfill_no_settle_to() {
     let acc = {
         let mut acc = ACCOUNT_DETAILS_1.clone();
         acc.username = Username::from_str("charlie").unwrap();
-        acc.ilp_address = Address::from_str("example.charlie").unwrap();
-        acc.http_incoming_token = None;
-        acc.http_outgoing_token = None;
-        acc.btp_incoming_token = None;
+        acc.ilp_address = Some(Address::from_str("example.charlie").unwrap());
+        acc.ilp_over_http_incoming_token = None;
+        acc.ilp_over_http_outgoing_token = None;
+        acc.ilp_over_btp_incoming_token = None;
         acc.settle_to = None;
         acc
     };
@@ -131,12 +135,12 @@ fn process_fulfill_settle_to_over_threshold() {
     let acc = {
         let mut acc = ACCOUNT_DETAILS_1.clone();
         acc.username = Username::from_str("charlie").unwrap();
-        acc.ilp_address = Address::from_str("example.b").unwrap();
+        acc.ilp_address = Some(Address::from_str("example.b").unwrap());
         acc.settle_to = Some(101);
         acc.settle_threshold = Some(100);
-        acc.http_incoming_token = None;
-        acc.http_outgoing_token = None;
-        acc.btp_incoming_token = None;
+        acc.ilp_over_http_incoming_token = None;
+        acc.ilp_over_http_outgoing_token = None;
+        acc.ilp_over_btp_incoming_token = None;
         acc
     };
     block_on(test_store().and_then(|(store, context, _accs)| {
@@ -168,12 +172,12 @@ fn process_fulfill_ok() {
     let acc = {
         let mut acc = ACCOUNT_DETAILS_1.clone();
         acc.username = Username::from_str("charlie").unwrap();
-        acc.ilp_address = Address::from_str("example.c").unwrap();
+        acc.ilp_address = Some(Address::from_str("example.c").unwrap());
         acc.settle_to = Some(0);
         acc.settle_threshold = Some(100);
-        acc.http_incoming_token = None;
-        acc.http_outgoing_token = None;
-        acc.btp_incoming_token = None;
+        acc.ilp_over_http_incoming_token = None;
+        acc.ilp_over_http_outgoing_token = None;
+        acc.ilp_over_btp_incoming_token = None;
         acc
     };
     block_on(test_store().and_then(|(store, context, _accs)| {

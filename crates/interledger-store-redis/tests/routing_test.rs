@@ -4,10 +4,9 @@ use bytes::Bytes;
 use common::*;
 use interledger_api::{AccountDetails, NodeStore};
 use interledger_ccp::RouteManagerStore;
-use interledger_ildcp::IldcpAccount;
 use interledger_packet::Address;
 use interledger_router::RouterStore;
-use interledger_service::{Account as AccountTrait, Username};
+use interledger_service::{Account as AccountTrait, AddressStore, Username};
 use interledger_store_redis::AccountId;
 use std::str::FromStr;
 use std::{collections::HashMap, time::Duration};
@@ -19,6 +18,7 @@ fn polls_for_route_updates() {
     block_on(
         RedisStoreBuilder::new(context.get_client_connection_info(), [0; 32])
             .poll_interval(1)
+            .node_ilp_address(Address::from_str("example.node").unwrap())
             .connect()
             .and_then(|store| {
                 let connection = context.async_connection();
@@ -37,17 +37,18 @@ fn polls_for_route_updates() {
                         );
                         store_clone_1
                             .insert_account(AccountDetails {
-                                ilp_address: Address::from_str("example.bob").unwrap(),
+                                ilp_address: Some(Address::from_str("example.bob").unwrap()),
                                 username: Username::from_str("bob").unwrap(),
                                 asset_scale: 6,
                                 asset_code: "XYZ".to_string(),
                                 max_packet_amount: 1000,
                                 min_balance: Some(-1000),
-                                http_endpoint: None,
-                                http_incoming_token: None,
-                                http_outgoing_token: None,
-                                btp_uri: None,
-                                btp_incoming_token: None,
+                                ilp_over_http_url: None,
+                                ilp_over_http_incoming_token: None,
+                                ilp_over_http_outgoing_token: None,
+                                ilp_over_btp_url: None,
+                                ilp_over_btp_outgoing_token: None,
+                                ilp_over_btp_incoming_token: None,
                                 settle_threshold: None,
                                 settle_to: None,
                                 routing_relation: Some("Peer".to_owned()),
@@ -124,8 +125,8 @@ fn gets_accounts_to_send_routes_to() {
             .get_accounts_to_send_routes_to()
             .and_then(move |accounts| {
                 assert_eq!(
-                    *accounts[0].client_address(),
-                    Address::from_str("example.bob").unwrap()
+                    *accounts[0].ilp_address(),
+                    Address::from_str("example.alice.user1.bob").unwrap()
                 );
                 assert_eq!(accounts.len(), 1);
                 let _ = context;
@@ -142,7 +143,7 @@ fn gets_accounts_to_receive_routes_from() {
             .get_accounts_to_receive_routes_from()
             .and_then(move |accounts| {
                 assert_eq!(
-                    *accounts[0].client_address(),
+                    *accounts[0].ilp_address(),
                     Address::from_str("example.alice").unwrap()
                 );
                 assert_eq!(accounts.len(), 1);
@@ -174,8 +175,20 @@ fn saves_routes_to_db() {
         let get_connection = context.async_connection();
         let account0_id = AccountId::new();
         let account1_id = AccountId::new();
-        let account0 = Account::try_from(account0_id, ACCOUNT_DETAILS_0.clone()).unwrap();
-        let account1 = Account::try_from(account1_id, ACCOUNT_DETAILS_1.clone()).unwrap();
+        let account0 = Account::try_from(
+            account0_id,
+            ACCOUNT_DETAILS_0.clone(),
+            store.get_ilp_address(),
+        )
+        .unwrap();
+
+        let account1 = Account::try_from(
+            account1_id,
+            ACCOUNT_DETAILS_1.clone(),
+            store.get_ilp_address(),
+        )
+        .unwrap();
+
         store
             .set_routes(vec![
                 (Bytes::from("example.a"), account0.clone()),
@@ -210,8 +223,18 @@ fn updates_local_routes() {
     block_on(test_store().and_then(|(store, context, _accs)| {
         let account0_id = AccountId::new();
         let account1_id = AccountId::new();
-        let account0 = Account::try_from(account0_id, ACCOUNT_DETAILS_0.clone()).unwrap();
-        let account1 = Account::try_from(account1_id, ACCOUNT_DETAILS_1.clone()).unwrap();
+        let account0 = Account::try_from(
+            account0_id,
+            ACCOUNT_DETAILS_0.clone(),
+            store.get_ilp_address(),
+        )
+        .unwrap();
+        let account1 = Account::try_from(
+            account1_id,
+            ACCOUNT_DETAILS_1.clone(),
+            store.get_ilp_address(),
+        )
+        .unwrap();
         store
             .clone()
             .set_routes(vec![
@@ -278,7 +301,12 @@ fn static_routes_override_others() {
             ])
             .and_then(move |_| {
                 let account1_id = AccountId::new();
-                let account1 = Account::try_from(account1_id, ACCOUNT_DETAILS_1.clone()).unwrap();
+                let account1 = Account::try_from(
+                    account1_id,
+                    ACCOUNT_DETAILS_1.clone(),
+                    store.get_ilp_address(),
+                )
+                .unwrap();
                 store_clone
                     .set_routes(vec![
                         (Bytes::from("example.a"), account1.clone()),

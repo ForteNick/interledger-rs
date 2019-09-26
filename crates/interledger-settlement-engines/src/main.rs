@@ -1,10 +1,16 @@
-use clap::{crate_version, App, AppSettings, Arg, ArgMatches, SubCommand};
-use config::{Config, FileFormat, Source, Value};
+use clap::{crate_version, App, AppSettings, ArgMatches};
+use config::{Config, FileFormat, Source};
 use futures::Future;
 use libc::{c_int, isatty};
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::vec::Vec;
+
+#[cfg(feature = "ethereum")]
+use clap::{Arg, SubCommand};
+
+#[cfg(feature = "ethereum")]
+use config::Value;
 
 #[cfg(feature = "ethereum")]
 use interledger_settlement_engines::engines::ethereum_ledger::{
@@ -23,11 +29,10 @@ pub fn main() {
     //     - Use `xxx_bind_address` because it becomes more flexible than just binding it to
     //       `127.0.0.1` with a given port.
     // - ILP over HTTP or BTP server URLs which accept ILP packets
-    //     - `http_server_url`
-    //     - `btp_server_url`
-    // - Addresses to which ILP over HTTP or BTP servers are bound
+    //     - `ilp_over_http_url`
+    //     - `ilp_over_btp_url`
+    // - Addresses to which ILP over HTTP servers are bound
     //     - `http_bind_address`
-    //     - `btp_bind_address`
     // - Addresses to which other services are bound
     //     - `xxx_bind_address`
     let mut app = App::new("interledger-settlement-engines")
@@ -184,6 +189,7 @@ fn merge_std_in(config: &mut Config) {
     }
 }
 
+#[cfg(feature = "ethereum")]
 fn merge_args(config: &mut Config, matches: &ArgMatches) {
     for (key, value) in &matches.args {
         if config.get_str(key).is_ok() {

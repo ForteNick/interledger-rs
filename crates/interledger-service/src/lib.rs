@@ -27,7 +27,7 @@
 //! HttpServerService --> ValidatorService --> StreamReceiverService
 
 use futures::{Future, IntoFuture};
-use interledger_packet::{Fulfill, Prepare, Reject};
+use interledger_packet::{Address, Fulfill, Prepare, Reject};
 use std::{
     cmp::Eq,
     fmt::{Debug, Display},
@@ -52,6 +52,9 @@ pub trait Account: Clone + Send + Sized + Debug {
 
     fn id(&self) -> Self::AccountId;
     fn username(&self) -> &Username;
+    fn ilp_address(&self) -> &Address;
+    fn asset_scale(&self) -> u8;
+    fn asset_code(&self) -> &str;
 }
 
 /// A struct representing an incoming ILP Prepare packet or an outgoing one before the next hop is set.
@@ -179,4 +182,17 @@ where
     fn send_request(&mut self, request: OutgoingRequest<A>) -> Self::Future {
         Box::new((self.handler)(request).into_future())
     }
+}
+
+pub trait AddressStore: Clone {
+    /// Saves the ILP Address in the store's memory and database
+    fn set_ilp_address(
+        &self,
+        ilp_address: Address,
+    ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
+
+    fn clear_ilp_address(&self) -> Box<dyn Future<Item = (), Error = ()> + Send>;
+
+    /// Get's the store's ilp address from memory
+    fn get_ilp_address(&self) -> Address;
 }

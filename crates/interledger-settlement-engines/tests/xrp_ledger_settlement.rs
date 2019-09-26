@@ -1,14 +1,11 @@
 #![recursion_limit = "128"]
 
-use env_logger;
 use futures::future::join_all;
 use futures::Future;
-use interledger::{
-    cli,
-    node::{AccountDetails, InterledgerNode},
-};
+use interledger::node::{random_secret, AccountDetails, InterledgerNode};
 use interledger_packet::Address;
 use interledger_service::Username;
+use secrecy::SecretString;
 use std::str::FromStr;
 use tokio::runtime::Builder as RuntimeBuilder;
 
@@ -73,13 +70,12 @@ fn xrp_ledger_settlement() {
         .build()
         .unwrap();
 
-    let node1_secret = cli::random_secret();
+    let node1_secret = random_secret();
     let node1 = InterledgerNode {
-        ilp_address: Address::from_str("example.alice").unwrap(),
+        ilp_address: Some(Address::from_str("example.alice").unwrap()),
         default_spsp_account: None,
         admin_auth_token: "hi_alice".to_string(),
         redis_connection: connection_info1.clone(),
-        btp_bind_address: ([127, 0, 0, 1], get_open_port(None)).into(),
         http_bind_address: ([127, 0, 0, 1], node1_http).into(),
         settlement_api_bind_address: ([127, 0, 0, 1], node1_settlement).into(),
         secret_seed: node1_secret,
@@ -93,15 +89,16 @@ fn xrp_ledger_settlement() {
         // TODO insert the accounts via HTTP request
         node1_clone
             .insert_account(AccountDetails {
-                ilp_address: Address::from_str("example.alice").unwrap(),
+                ilp_address: Some(Address::from_str("example.alice").unwrap()),
                 username: Username::from_str("alice").unwrap(),
                 asset_code: "XRP".to_string(),
                 asset_scale: xrp_decimals,
-                btp_incoming_token: None,
-                btp_uri: None,
-                http_endpoint: None,
-                http_incoming_token: Some("in_alice".to_string()),
-                http_outgoing_token: None,
+                ilp_over_btp_url: None,
+                ilp_over_btp_incoming_token: None,
+                ilp_over_btp_outgoing_token: None,
+                ilp_over_http_url: None,
+                ilp_over_http_incoming_token: Some(SecretString::new("in_alice".to_string())),
+                ilp_over_http_outgoing_token: None,
                 max_packet_amount: 10,
                 min_balance: None,
                 settle_threshold: None,
@@ -114,15 +111,16 @@ fn xrp_ledger_settlement() {
             })
             .and_then(move |_| {
                 node1_clone.insert_account(AccountDetails {
-                    ilp_address: Address::from_str("example.bob").unwrap(),
+                    ilp_address: Some(Address::from_str("example.bob").unwrap()),
                     username: Username::from_str("bob").unwrap(),
                     asset_code: "XRP".to_string(),
                     asset_scale: xrp_decimals,
-                    btp_incoming_token: None,
-                    btp_uri: None,
-                    http_endpoint: Some(format!("http://localhost:{}/ilp", node2_http)),
-                    http_incoming_token: Some("alice".to_string()),
-                    http_outgoing_token: Some("alice:bob".to_string()),
+                    ilp_over_btp_url: None,
+                    ilp_over_btp_incoming_token: None,
+                    ilp_over_btp_outgoing_token: None,
+                    ilp_over_http_url: Some(format!("http://localhost:{}/ilp", node2_http)),
+                    ilp_over_http_incoming_token: Some(SecretString::new("alice".to_string())),
+                    ilp_over_http_outgoing_token: Some(SecretString::new("alice:bob".to_string())),
                     max_packet_amount: 10,
                     min_balance: Some(-100),
                     settle_threshold: Some(70),
@@ -137,13 +135,12 @@ fn xrp_ledger_settlement() {
             .and_then(move |_| node1.serve()),
     );
 
-    let node2_secret = cli::random_secret();
+    let node2_secret = random_secret();
     let node2 = InterledgerNode {
-        ilp_address: Address::from_str("example.bob").unwrap(),
+        ilp_address: Some(Address::from_str("example.bob").unwrap()),
         default_spsp_account: None,
         admin_auth_token: "admin".to_string(),
         redis_connection: connection_info2.clone(),
-        btp_bind_address: ([127, 0, 0, 1], get_open_port(None)).into(),
         http_bind_address: ([127, 0, 0, 1], node2_http).into(),
         settlement_api_bind_address: ([127, 0, 0, 1], node2_settlement).into(),
         secret_seed: node2_secret,
@@ -155,15 +152,16 @@ fn xrp_ledger_settlement() {
     runtime.spawn(
         node2
             .insert_account(AccountDetails {
-                ilp_address: Address::from_str("example.bob").unwrap(),
+                ilp_address: Some(Address::from_str("example.bob").unwrap()),
                 username: Username::from_str("bob").unwrap(),
                 asset_code: "XRP".to_string(),
                 asset_scale: xrp_decimals,
-                btp_incoming_token: None,
-                btp_uri: None,
-                http_endpoint: None,
-                http_incoming_token: Some("in_bob".to_string()),
-                http_outgoing_token: None,
+                ilp_over_btp_url: None,
+                ilp_over_btp_incoming_token: None,
+                ilp_over_btp_outgoing_token: None,
+                ilp_over_http_url: None,
+                ilp_over_http_incoming_token: Some(SecretString::new("in_bob".to_string())),
+                ilp_over_http_outgoing_token: None,
                 max_packet_amount: 10,
                 min_balance: None,
                 settle_threshold: None,
@@ -177,15 +175,18 @@ fn xrp_ledger_settlement() {
             .and_then(move |_| {
                 node2
                     .insert_account(AccountDetails {
-                        ilp_address: Address::from_str("example.alice").unwrap(),
+                        ilp_address: Some(Address::from_str("example.alice").unwrap()),
                         username: Username::from_str("alice").unwrap(),
                         asset_code: "XRP".to_string(),
                         asset_scale: xrp_decimals,
-                        btp_incoming_token: None,
-                        btp_uri: None,
-                        http_endpoint: Some(format!("http://localhost:{}/ilp", node1_http)),
-                        http_incoming_token: Some("bob".to_string()),
-                        http_outgoing_token: Some("bob:alice".to_string()),
+                        ilp_over_btp_url: None,
+                        ilp_over_btp_incoming_token: None,
+                        ilp_over_btp_outgoing_token: None,
+                        ilp_over_http_url: Some(format!("http://localhost:{}/ilp", node1_http)),
+                        ilp_over_http_incoming_token: Some(SecretString::new("bob".to_string())),
+                        ilp_over_http_outgoing_token: Some(SecretString::new(
+                            "bob:alice".to_string(),
+                        )),
                         max_packet_amount: 10,
                         min_balance: Some(-100),
                         settle_threshold: Some(70),

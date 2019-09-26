@@ -14,30 +14,33 @@ By default, the API is available on port `7770`.
 
 #### Request
 
-The request must include:
+At minimum the request must include the following parameters:
 
 ```json
 {
-    "ilp_address": "example.other-node",
+    "username": "other_node",
     "asset_code": "ABC",
     "asset_scale": 9
 }
 ```
 
-Optional fields include:
+The comprehensive list of possible parameters is as follows:
 
 ```json
 {
+    "username": "other_node",
     "ilp_address": "example.other-node",
     "asset_code": "ABC",
     "asset_scale": 9,
     "max_packet_amount": 100000000000,
     "min_balance": 0,
-    "http_incoming_token": "http bearer token they will use to authenticate with us",
-    "http_endpoint": "https://peer-ilp-over-http-endpoint.example/ilp",
-    "http_outgoing_token": "http bearer token we will use to authenticate with them",
-    "btp_uri": "btp+wss://:auth-token@peer-btp-endpoint",
-    "btp_incoming_token": "btp auth token they will use to authenticate with us",
+    "ilp_over_http_url": "https://peer-ilp-over-http-endpoint.example/ilp",
+    "ilp_over_http_incoming_token": "http bearer token they will use to authenticate with us",
+    "ilp_over_http_outgoing_token": "http bearer token we will use to authenticate with them",
+    "ilp_over_btp_url": "btp+wss://peer-btp-endpoint",
+    "ilp_over_btp_outgoing_token": "btp auth token we will use to authenticate with them",
+    "ilp_over_btp_incoming_token": "btp auth token they will use to authenticate with us",
+    "settlement_engine_url": "http://settlement-engine-for-this-account:3000",
     "settle_threshold": 1000000000,
     "settle_to": 0,
     "routing_relation": "Peer",
@@ -51,11 +54,11 @@ Optional fields include:
 
 Admin only.
 
-### GET /accounts/:id
+### GET /accounts/:username
 
 Admin or account-holder only.
 
-### GET /accounts/:id/balance
+### GET /accounts/:username/balance
 
 Admin or account-holder only.
 
@@ -69,7 +72,7 @@ Admin or account-holder only.
 
 ## SPSP (Sending Payments)
 
-### POST /pay
+### POST /accounts/:username/payments
 
 Account-holder only.
 
@@ -90,7 +93,7 @@ Account-holder only.
 }
 ```
 
-### GET /spsp/:id
+### GET /accounts/:username/spsp
 
 No authentication required.
 
@@ -113,6 +116,24 @@ No authentication required.
 This is the "default" SPSP receiver account on this node. This endpoint is only enabled if the node is run with the configuration option `ILP_DEFAULT_SPSP_ACCOUNT={account id}`.
 
 Same response as above.
+
+## Bilateral Node-to-Node Communication for ILP Packets
+
+### POST /ilp - ILP-over-HTTP
+
+Account-holder only.
+
+This endpoint is used by nodes to send ILP packets over HTTP requests, as the name suggests. This protocol is specified in [IL-RFC 35: ILP-over-HTTP](https://github.com/interledger/rfcs/blob/master/0035-ilp-over-http/0035-ilp-over-http.md).
+
+Note this endpoint is the one referred to as `ilp_over_http_url` in the `AccountSettings`.
+
+### (Websocket) /ilp/btp - Bilateral Transfer Protocol (BTP)
+
+Account-holder only.
+
+This endpoint implements BTP, a WebSocket-based protocol for sending and receiving ILP packets. This protocol is specified in [IL-RFC 22: Bilateral Transfer Protocol 2.0 (BTP/2.0)](https://github.com/interledger/rfcs/blob/master/0023-bilateral-transfer-protocol/0023-bilateral-transfer-protocol.md).
+
+Note this endpoint is the one referred to as `ilp_over_btp_url` in the `AccountSettings`.
 
 ## Node Settings
 

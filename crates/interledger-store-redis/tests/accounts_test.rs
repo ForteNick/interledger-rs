@@ -2,16 +2,61 @@ mod common;
 
 use common::*;
 
+use futures::future::{result, Either};
 use interledger_api::{AccountSettings, NodeStore};
 use interledger_btp::{BtpAccount, BtpStore};
+use interledger_ccp::{CcpRoutingAccount, RoutingRelation};
 use interledger_http::{HttpAccount, HttpStore};
-use interledger_ildcp::IldcpAccount;
 use interledger_packet::Address;
 use interledger_service::Account as AccountTrait;
-use interledger_service::{AccountStore, Username};
+use interledger_service::{AccountStore, AddressStore, Username};
 use interledger_service_util::BalanceStore;
 use interledger_store_redis::AccountId;
+use log::{debug, error};
+use redis::Client;
+use secrecy::SecretString;
 use std::str::FromStr;
+
+#[test]
+fn picks_up_parent_during_initialization() {
+    let context = TestContext::new();
+    block_on(
+        result(Client::open(context.get_client_connection_info()))
+            .map_err(|err| error!("Error creating Redis client: {:?}", err))
+            .and_then(|client| {
+                debug!("Connected to redis: {:?}", client);
+                client
+                    .get_shared_async_connection()
+                    .map_err(|err| error!("Error connecting to Redis: {:?}", err))
+            })
+            .and_then(move |connection| {
+                // we set a parent that was already configured via perhaps a
+                // previous account insertion. that means that when we connect
+                // to the store we will always get the configured parent (if
+                // there was one))
+                redis::cmd("SET")
+                    .arg("parent_node_account_address")
+                    .arg("example.bob.node")
+                    .query_async(connection)
+                    .map_err(|err| panic!(err))
+                    .and_then(move |(_, _): (_, redis::Value)| {
+                        RedisStoreBuilder::new(context.get_client_connection_info(), [0; 32])
+                            .connect()
+                            .and_then(move |store| {
+                                // the store's ilp address is the store's
+                                // username appended to the parent's address
+                                assert_eq!(
+                                    *store.ilp_address.read(),
+                                    Address::from_str("example.bob.node").unwrap()
+                                );
+                                let _ = context;
+                                Ok(())
+                            })
+                    })
+            }),
+    )
+    .unwrap();
+}
 
 #[test]
 fn insert_accounts() {
@@ -20,12 +65,82 @@ fn insert_accounts() {
             .insert_account(ACCOUNT_DETAILS_2.clone())
             .and_then(move |account| {
                 assert_eq!(
-                    *account.client_address(),
-                    Address::from_str("example.charlie").unwrap()
+                    *account.ilp_address(),
+                    Address::from_str("example.alice.user1.charlie").unwrap()
                 );
                 let _ = context;
                 Ok(())
             })
+    }))
+    .unwrap();
+}
+
+#[test]
+fn update_ilp_and_children_addresses() {
+    block_on(test_store().and_then(|(store, context, accs)| {
+        let mut accs = accs.clone();
+        accs.sort_by(|a, b| {
+            a.username()
+                .as_bytes()
+                .partial_cmp(b.username().as_bytes())
+                .unwrap()
+        });
+        let ilp_address = Address::from_str("test.parent.our_address").unwrap();
+        store
+            .set_ilp_address(ilp_address.clone())
+            .and_then(move |_| {
+                let ret = store.get_ilp_address();
+                assert_eq!(ilp_address, ret);
+                store.get_all_accounts().and_then(move |accounts: Vec<_>| {
+                    let mut accounts = accounts.clone();
+                    accounts.sort_by(|a, b| {
+                        a.username()
+                            .as_bytes()
+                            .partial_cmp(b.username().as_bytes())
+                            .unwrap()
+                    });
+                    for (a, b) in accounts.into_iter().zip(&accs) {
+                        if a.routing_relation() == RoutingRelation::Child {
+                            assert_eq!(
+                                *a.ilp_address(),
+                                ilp_address.with_suffix(a.username().as_bytes()).unwrap()
+                            );
+                        } else {
+                            assert_eq!(a.ilp_address(), b.ilp_address());
+                        }
+                    }
+                    let _ = context;
+                    Ok(())
+                })
+            })
+    }))
+    .unwrap();
+}
+
+#[test]
+fn only_one_parent_allowed() {
+    let mut acc = ACCOUNT_DETAILS_2.clone();
+    acc.routing_relation = Some("Parent".to_owned());
+    acc.username = Username::from_str("another_name").unwrap();
+    acc.ilp_address = Some(Address::from_str("example.another_name").unwrap());
+    block_on(test_store().and_then(|(store, context, accs)| {
+        store.insert_account(acc.clone()).then(move |res| {
+            // This should fail
+            assert!(res.is_err());
+            futures::future::join_all(vec![
+                Either::A(store.delete_account(accs[0].id()).and_then(|_| Ok(()))),
+                // must also clear the ILP Address to indicate that we no longer
+                // have a parent account configured
+                Either::B(store.clear_ilp_address()),
+            ])
+            .and_then(move |_| {
+                store.insert_account(acc).and_then(move |_| {
+                    // the call was successful, so the parent was succesfully added
+                    let _ = context;
+                    Ok(())
+                })
+            })
+        })
     }))
     .unwrap();
 }
@@ -117,8 +232,8 @@ fn modify_account_settings_unchanged() {
                     ret.get_http_auth_token().unwrap()
                 );
                 assert_eq!(
-                    account.get_btp_token().unwrap(),
-                    ret.get_btp_token().unwrap()
+                    account.get_ilp_over_btp_outgoing_token().unwrap(),
+                    ret.get_ilp_over_btp_outgoing_token().unwrap()
                 );
                 // Cannot check other parameters since they are only pub(crate).
                 let _ = context;
@@ -132,12 +247,12 @@ fn modify_account_settings_unchanged() {
 fn modify_account_settings() {
     block_on(test_store().and_then(|(store, context, accounts)| {
         let settings = AccountSettings {
-            http_outgoing_token: Some("dylan:test_token".to_owned()),
-            http_incoming_token: Some("http_in_new".to_owned()),
-            btp_outgoing_token: Some("dylan:test".to_owned()),
-            btp_incoming_token: Some("btp_in_new".to_owned()),
-            http_endpoint: Some("http://example.com".to_owned()),
-            btp_uri: Some("http://example.com".to_owned()),
+            ilp_over_http_outgoing_token: Some(SecretString::new("dylan:test_token".to_owned())),
+            ilp_over_http_incoming_token: Some(SecretString::new("http_in_new".to_owned())),
+            ilp_over_btp_outgoing_token: Some(SecretString::new("dylan:test".to_owned())),
+            ilp_over_btp_incoming_token: Some(SecretString::new("btp_in_new".to_owned())),
+            ilp_over_http_url: Some("http://example.com".to_owned()),
+            ilp_over_btp_url: Some("http://example.com".to_owned()),
             settle_threshold: Some(-50),
             settle_to: Some(100),
         };
@@ -148,7 +263,10 @@ fn modify_account_settings() {
             .modify_account_settings(id, settings)
             .and_then(move |ret| {
                 assert_eq!(ret.get_http_auth_token().unwrap(), "dylan:test_token",);
-                assert_eq!(ret.get_btp_token().unwrap(), &b"dylan:test"[..],);
+                assert_eq!(
+                    ret.get_ilp_over_btp_outgoing_token().unwrap(),
+                    &b"dylan:test"[..],
+                );
                 // Cannot check other parameters since they are only pub(crate).
                 let _ = context;
                 Ok(())
@@ -187,7 +305,8 @@ fn fetches_account_from_username() {
 #[test]
 fn duplicate_http_incoming_auth_works() {
     let mut duplicate = ACCOUNT_DETAILS_2.clone();
-    duplicate.http_incoming_token = Some("incoming_auth_token".to_string());
+    duplicate.ilp_over_http_incoming_token =
+        Some(SecretString::new("incoming_auth_token".to_string()));
     block_on(test_store().and_then(|(store, context, accs)| {
         let original = accs[0].clone();
         let original_id = original.id();
@@ -254,7 +373,7 @@ fn gets_account_from_http_auth() {
 #[test]
 fn duplicate_btp_incoming_auth_works() {
     let mut charlie = ACCOUNT_DETAILS_2.clone();
-    charlie.btp_incoming_token = Some("btp_token".to_string());
+    charlie.ilp_over_btp_incoming_token = Some(SecretString::new("btp_token".to_string()));
     block_on(test_store().and_then(|(store, context, accs)| {
         let alice = accs[0].clone();
         let alice_id = alice.id();
@@ -300,7 +419,7 @@ fn gets_single_account() {
         store_clone
             .get_accounts(vec![acc.id()])
             .and_then(move |accounts| {
-                assert_eq!(accounts[0].client_address(), acc.client_address(),);
+                assert_eq!(accounts[0].ilp_address(), acc.ilp_address());
                 let _ = context;
                 Ok(())
             })
@@ -318,8 +437,8 @@ fn gets_multiple() {
             .get_accounts(account_ids)
             .and_then(move |accounts| {
                 // note reverse order is intentional
-                assert_eq!(accounts[0].client_address(), accs[1].client_address());
-                assert_eq!(accounts[1].client_address(), accs[0].client_address());
+                assert_eq!(accounts[0].ilp_address(), accs[1].ilp_address());
+                assert_eq!(accounts[1].ilp_address(), accs[0].ilp_address());
                 let _ = context;
                 Ok(())
             })
@@ -340,8 +459,8 @@ fn decrypts_outgoing_tokens_acc() {
                     acc.get_http_auth_token().unwrap(),
                 );
                 assert_eq!(
-                    account.get_btp_token().unwrap(),
-                    acc.get_btp_token().unwrap(),
+                    account.get_ilp_over_btp_outgoing_token().unwrap(),
+                    acc.get_ilp_over_btp_outgoing_token().unwrap(),
                 );
                 let _ = context;
                 Ok(())

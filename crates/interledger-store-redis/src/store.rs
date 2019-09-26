@@ -20,6 +20,7 @@ use super::crypto::{encrypt_token, generate_keys, DecryptionKey, EncryptionKey};
 use bytes::Bytes;
 use futures::{
     future::{err, ok, result, Either},
+    sync::mpsc::UnboundedSender,
     Future, Stream,
 };
 use log::{debug, error, trace, warn};
@@ -27,19 +28,23 @@ use std::collections::{HashMap, HashSet};
 
 use super::account::AccountId;
 use http::StatusCode;
-use interledger_api::{AccountDetails, AccountSettings, NodeStore};
+use interledger_api::{AccountDetails, AccountSettings, EncryptedAccountSettings, NodeStore};
 use interledger_btp::BtpStore;
-use interledger_ccp::{CcpRoutingAccount, RouteManagerStore};
+use interledger_ccp::{CcpRoutingAccount, RouteManagerStore, RoutingRelation};
 use interledger_http::HttpStore;
+use interledger_packet::Address;
 use interledger_router::RouterStore;
-use interledger_service::{Account as AccountTrait, AccountStore, Username};
+use interledger_service::{Account as AccountTrait, AccountStore, AddressStore, Username};
 use interledger_service_util::{BalanceStore, ExchangeRateStore, RateLimitError, RateLimitStore};
 use interledger_settlement::{IdempotentData, IdempotentStore, SettlementStore};
+use interledger_stream::{PaymentNotification, StreamNotificationsStore};
 use lazy_static::lazy_static;
 use parking_lot::RwLock;
 use redis::{
-    self, aio::SharedConnection, cmd, Client, ConnectionInfo, PipelineCommands, Script, Value,
+    self, aio::SharedConnection, cmd, Client, ConnectionInfo, ControlFlow, PipelineCommands,
+    PubSubCommands, Script, Value,
 };
+use serde_json;
 use std::{
     iter::FromIterator,
     str,
@@ -54,6 +59,7 @@ use secrecy::{ExposeSecret, Secret};
 use zeroize::Zeroize;
 
 const DEFAULT_POLL_INTERVAL: u64 = 30000; // 30 seconds
+static PARENT_ILP_KEY: &str = "parent_node_account_address";
 
 // The following are Lua scripts that are used to atomically execute the given logic
 // inside Redis. This allows for more complex logic without needing multiple round
@@ -61,6 +67,8 @@ const DEFAULT_POLL_INTERVAL: u64 = 30000; // 30 seconds
 // process is accessing Redis at the same time.
 // For more information on scripting in Redis, see https://redis.io/commands/eval
 lazy_static! {
+    static ref DEFAULT_ILP_ADDRESS: Address = Address::from_str("local.host").unwrap();
+
     // This lua script fetches an account associated with a username. The client
     // MUST ensure that the returned account is authenticated.
     static ref ACCOUNT_FROM_USERNAME: Script = Script::new("
@@ -169,6 +177,7 @@ lazy_static! {
 
 static ROUTES_KEY: &str = "routes:current";
 static STATIC_ROUTES_KEY: &str = "routes:static";
+static STREAM_NOTIFICATIONS_PREFIX: &str = "stream_notifications:";
 
 fn prefixed_idempotency_key(idempotency_key: String) -> String {
     format!("idempotency-key:{}", idempotency_key)
@@ -182,6 +191,7 @@ pub struct RedisStoreBuilder {
     redis_url: ConnectionInfo,
     secret: [u8; 32],
     poll_interval: u64,
+    node_ilp_address: Address,
 }
 
 impl RedisStoreBuilder {
@@ -190,7 +200,13 @@ impl RedisStoreBuilder {
             redis_url,
             secret,
             poll_interval: DEFAULT_POLL_INTERVAL,
+            node_ilp_address: DEFAULT_ILP_ADDRESS.clone(),
         }
+    }
+
+    pub fn node_ilp_address(&mut self, node_ilp_address: Address) -> &mut Self {
+        self.node_ilp_address = node_ilp_address;
+        self
     }
 
     pub fn poll_interval(&mut self, poll_interval: u64) -> &mut Self {
@@ -199,50 +215,127 @@ impl RedisStoreBuilder {
     }
 
     pub fn connect(&mut self) -> impl Future<Item = RedisStore, Error = ()> {
+        let redis_info = self.redis_url.clone();
         let (encryption_key, decryption_key) = generate_keys(&self.secret[..]);
         self.secret.zeroize(); // clear the secret after it has been used for key generation
         let poll_interval = self.poll_interval;
+        let ilp_address = self.node_ilp_address.clone();
 
-        result(Client::open(self.redis_url.clone()))
-            .map_err(|err| error!("Error creating Redis client: {:?}", err))
+        result(Client::open(redis_info.clone()))
+            .map_err(|err| error!("Error creating shared Redis client: {:?}", err))
             .and_then(|client| {
-                debug!("Connected to redis: {:?}", client);
+                debug!("Connected shared client to redis: {:?}", client);
                 client
                     .get_shared_async_connection()
-                    .map_err(|err| error!("Error connecting to Redis: {:?}", err))
+                    .map_err(|err| error!("Error connecting shared client to Redis: {:?}", err))
             })
-            .and_then(move |connection| {
-                let store = RedisStore {
-                    connection: Arc::new(connection),
-                    exchange_rates: Arc::new(RwLock::new(HashMap::new())),
-                    routes: Arc::new(RwLock::new(HashMap::new())),
-                    encryption_key: Arc::new(encryption_key),
-                    decryption_key: Arc::new(decryption_key),
-                };
+            .join(
+                result(Client::open(redis_info.clone()))
+                    .map_err(|err| error!("Error creating subscription Redis client: {:?}", err))
+                    .and_then(|client| {
+                        debug!("Connected subscription client to redis: {:?}", client);
+                        client.get_connection().map_err(|err| {
+                            error!("Error connecting subscription client to Redis: {:?}", err)
+                        })
+                    }),
+            )
+            .and_then(move |(shared_connection, mut sub_connection)| {
+                // Before initializing the store, check if we have an address
+                // that was configured due to adding a parent. If no parent was
+                // found, use the builder's provided address (local.host) or the
+                // one we decided to override it with
+                redis::cmd("GET")
+                    .arg(PARENT_ILP_KEY)
+                    .query_async(shared_connection.clone())
+                    .map_err(|err| {
+                        error!(
+                            "Error checking whether we have a parent configured: {:?}",
+                            err
+                        )
+                    })
+                    .and_then(move |(_, address): (SharedConnection, Option<String>)| {
+                        Ok(if let Some(address) = address {
+                            Address::from_str(&address).unwrap()
+                        } else {
+                            ilp_address
+                        })
+                    })
+                    .and_then(move |node_ilp_address| {
+                        let store = RedisStore {
+                            ilp_address: Arc::new(RwLock::new(node_ilp_address)),
+                            connection: Arc::new(shared_connection),
+                            subscriptions: Arc::new(RwLock::new(HashMap::new())),
+                            exchange_rates: Arc::new(RwLock::new(HashMap::new())),
+                            routes: Arc::new(RwLock::new(HashMap::new())),
+                            encryption_key: Arc::new(encryption_key),
+                            decryption_key: Arc::new(decryption_key),
+                        };
 
-                // Poll for routing table updates
-                // Note: if this behavior changes, make sure to update the Drop implementation
-                let connection_clone = Arc::downgrade(&store.connection);
-                let routing_table = store.routes.clone();
-                let poll_routes =
-                    Interval::new(Instant::now(), Duration::from_millis(poll_interval))
-                        .map_err(|err| error!("Interval error: {:?}", err))
-                        .for_each(move |_| {
-                            if let Some(connection) = connection_clone.upgrade() {
-                                Either::A(update_routes(
-                                    connection.as_ref().clone(),
-                                    routing_table.clone(),
-                                ))
-                            } else {
-                                debug!("Not polling routes anymore because connection was closed");
-                                // TODO make sure the interval stops
-                                Either::B(err(()))
+                        // Poll for routing table updates
+                        // Note: if this behavior changes, make sure to update the Drop implementation
+                        let connection_clone = Arc::downgrade(&store.connection);
+                        let routing_table = store.routes.clone();
+                        let poll_routes =
+                            Interval::new(Instant::now(), Duration::from_millis(poll_interval))
+                                .map_err(|err| error!("Interval error: {:?}", err))
+                                .for_each(move |_| {
+                                    if let Some(connection) = connection_clone.upgrade() {
+                                        Either::A(update_routes(
+                                            connection.as_ref().clone(),
+                                            routing_table.clone(),
+                                        ))
+                                    } else {
+                                        debug!("Not polling routes anymore because connection was closed");
+                                        // TODO make sure the interval stops
+                                        Either::B(err(()))
+                                    }
+                                });
+                        spawn(poll_routes);
+
+                        // Here we spawn a worker thread to listen for incoming messages on Redis pub/sub,
+                        // running a callback for each message received.
+                        // This currently must be a thread rather than a task due to the redis-rs driver
+                        // not yet supporting asynchronous subscriptions (see https://github.com/mitsuhiko/redis-rs/issues/183).
+                        let subscriptions_clone = store.subscriptions.clone();
+                        std::thread::spawn(move || {
+                            let sub_status =
+                                sub_connection.psubscribe::<_, _, Vec<String>>(&["*"], move |msg| {
+                                    let channel_name = msg.get_channel_name();
+                                    if channel_name.starts_with(STREAM_NOTIFICATIONS_PREFIX) {
+                                        if let Ok(account_id) = AccountId::from_str(&channel_name[STREAM_NOTIFICATIONS_PREFIX.len()..]) {
+                                            let message: PaymentNotification = match serde_json::from_slice(msg.get_payload_bytes()) {
+                                                Ok(s) => s,
+                                                Err(e) => {
+                                                    error!("Failed to get payload from subscription: {}", e);
+                                                    return ControlFlow::Continue;
+                                                }
+                                            };
+                                            debug!("Subscribed message received for {:?}", account_id);
+                                            match subscriptions_clone.read().get(&account_id) {
+                                                Some(sender) => {
+                                                    if let Err(err) = sender.unbounded_send(message) {
+                                                        error!("Failed to send message: {}", err);
+                                                    }
+                                                }
+                                                None => trace!("Ignoring message for account {} because there were no open subscriptions", account_id),
+                                            }
+                                        } else {
+                                            error!("Invalid AccountId in channel name: {}", channel_name);
+                                        }
+                                    } else {
+                                        warn!("Ignoring unexpected message from Redis subscription for channel: {}", channel_name);
+                                    }
+                                    ControlFlow::Continue
+                                });
+                            match sub_status {
+                                Err(e) => warn!("Could not issue psubscribe to Redis: {}", e),
+                                Ok(_) => debug!("Successfully issued psubscribe to Redis"),
                             }
                         });
-                spawn(poll_routes);
 
                 Ok(store)
             })
+        })
     }
 }
 
@@ -254,7 +347,9 @@ impl RedisStoreBuilder {
 /// future versions of it will use PubSub to subscribe to updates.
 #[derive(Clone)]
 pub struct RedisStore {
+    pub ilp_address: Arc<RwLock<Address>>,
     connection: Arc<SharedConnection>,
+    subscriptions: Arc<RwLock<HashMap<AccountId, UnboundedSender<PaymentNotification>>>>,
     exchange_rates: Arc<RwLock<HashMap<String, f64>>>,
     routes: Arc<RwLock<HashMap<Bytes, AccountId>>>,
     encryption_key: Arc<Secret<EncryptionKey>>,
@@ -272,126 +367,117 @@ impl RedisStore {
 
     fn redis_insert_account(
         &self,
-        account: AccountDetails,
-    ) -> Box<dyn Future<Item = Account, Error = ()> + Send> {
+        encrypted: AccountWithEncryptedTokens,
+    ) -> Box<dyn Future<Item = AccountWithEncryptedTokens, Error = ()> + Send> {
+        let account = encrypted.account.clone();
+        let ret = encrypted.clone();
         let connection = self.connection.clone();
         let routing_table = self.routes.clone();
-        let encryption_key = self.encryption_key.clone();
+        // Check that there isn't already an account with values that MUST be unique
+        let mut pipe = redis::pipe();
+        pipe.exists(accounts_key(account.id));
+        pipe.hexists("usernames", account.username().as_ref());
+        if account.routing_relation == RoutingRelation::Parent {
+            pipe.exists(PARENT_ILP_KEY);
+        }
 
-        let id = AccountId::new();
-        debug!("Generated account: {}", id);
-        Box::new(
-            result(Account::try_from(id, account))
-                .and_then(move |account| {
-                    // Check that there isn't already an account with values that MUST be unique
-                    let mut pipe = redis::pipe();
-                    pipe.exists(accounts_key(account.id));
-                    pipe.hexists("usernames", account.username().as_ref());
-
-                    pipe.query_async(connection.as_ref().clone())
-                        .map_err(|err| {
-                            error!("Error checking whether account details already exist: {:?}", err)
-                        })
-                        .and_then(
-                            move |(connection, results): (SharedConnection, Vec<bool>)| {
-                                if results.iter().any(|val| *val) {
-                                    warn!("An account already exists with the same {}. Cannot insert account: {:?}", id, account);
-                                    Err(())
-                                } else {
-                                    Ok((connection, account))
-                                }
-                            },
-                        )
-                })
-                .and_then(move |(connection, account)| {
-                    let mut pipe = redis::pipe();
-                    pipe.atomic();
-
-                    // Add the account key to the list of accounts
-                    pipe.sadd("accounts", id).ignore();
-
-                    // Save map for Username -> Account ID
-                    pipe.hset("usernames", account.username().as_ref(), id).ignore();
-
-                    // Set account details
-                    pipe.cmd("HMSET").arg(accounts_key(account.id)).arg(account.clone().encrypt_tokens(&encryption_key.expose_secret().0))
-                        .ignore();
-
-                    // Set balance-related details
-                    pipe.hset_multiple(accounts_key(account.id), &[("balance", 0), ("prepaid_amount", 0)]).ignore();
-
-                    if account.should_send_routes() {
-                        pipe.sadd("send_routes_to", account.id).ignore();
+        Box::new(pipe.query_async(connection.as_ref().clone())
+            .map_err(|err| {
+                error!("Error checking whether account details already exist: {:?}", err)
+            })
+            .and_then(
+                move |(connection, results): (SharedConnection, Vec<bool>)| {
+                    if results.iter().any(|val| *val) {
+                        warn!("An account already exists with the same {}. Cannot insert account: {:?}", account.id, account);
+                        Err(())
+                    } else {
+                        Ok((connection, account))
                     }
+            })
+            .and_then(move |(connection, account)| {
+                let mut pipe = redis::pipe();
+                pipe.atomic();
 
-                    if account.should_receive_routes() {
-                        pipe.sadd("receive_routes_from", account.id).ignore();
-                    }
+                // Add the account key to the list of accounts
+                pipe.sadd("accounts", account.id).ignore();
 
-                    if account.btp_uri.is_some() {
-                        pipe.sadd("btp_outgoing", account.id).ignore();
-                    }
+                // Save map for Username -> Account ID
+                pipe.hset("usernames", account.username().as_ref(), account.id).ignore();
 
-                    // Add route to routing table
-                    pipe.hset(ROUTES_KEY, account.ilp_address.to_bytes().to_vec(), account.id)
-                        .ignore();
+                // Set account details
+                pipe.cmd("HMSET")
+                    .arg(accounts_key(account.id))
+                    .arg(encrypted).ignore();
 
-                    pipe.query_async(connection)
-                        .map_err(|err| error!("Error inserting account into DB: {:?}", err))
-                        .and_then(move |(connection, _ret): (SharedConnection, Value)| {
-                            update_routes(connection, routing_table)
-                        })
-                        .and_then(move |_| {
-                            debug!("Inserted account {} (ILP address: {})", account.id, str::from_utf8(account.ilp_address.as_ref()).unwrap_or("<not utf8>"));
-                            Ok(account)
-                        })
-                })
-        )
+                // Set balance-related details
+                pipe.hset_multiple(accounts_key(account.id), &[("balance", 0), ("prepaid_amount", 0)]).ignore();
+
+                if account.should_send_routes() {
+                    pipe.sadd("send_routes_to", account.id).ignore();
+                }
+
+                if account.should_receive_routes() {
+                    pipe.sadd("receive_routes_from", account.id).ignore();
+                }
+
+                if account.ilp_over_btp_url.is_some() {
+                    pipe.sadd("btp_outgoing", account.id).ignore();
+                }
+
+                // Add route to routing table
+                pipe.hset(ROUTES_KEY, account.ilp_address.to_bytes().to_vec(), account.id)
+                    .ignore();
+
+                // The parent account settings are done via the API. We just
+                // had to check for the existence of a parent
+                pipe.query_async(connection)
+                    .map_err(|err| error!("Error inserting account into DB: {:?}", err))
+                    .and_then(move |(connection, _ret): (SharedConnection, Value)| {
+                        update_routes(connection, routing_table)
+                    })
+                    .and_then(move |_| {
+                        debug!("Inserted account {} (ILP address: {})", account.id, account.ilp_address);
+                        Ok(ret)
+                    })
+            }))
     }
 
     fn redis_update_account(
         &self,
-        id: AccountId,
-        account: AccountDetails,
-    ) -> Box<dyn Future<Item = Account, Error = ()> + Send> {
+        encrypted: AccountWithEncryptedTokens,
+    ) -> Box<dyn Future<Item = AccountWithEncryptedTokens, Error = ()> + Send> {
+        let account = encrypted.account.clone();
         let connection = self.connection.clone();
         let routing_table = self.routes.clone();
-        let encryption_key = self.encryption_key.clone();
-
         Box::new(
             // Check to make sure an account with this ID already exists
             redis::cmd("EXISTS")
-                .arg(accounts_key(id))
-                // TODO this needs to be atomic with the insertions later, waiting on #186
+                .arg(accounts_key(account.id))
+                // TODO this needs to be atomic with the insertions later,
+                // waiting on #186
+                // TODO: Do not allow this update to happen if
+                // AccountDetails.RoutingRelation == Parent and parent is
+                // already set
                 .query_async(connection.as_ref().clone())
                 .map_err(|err| error!("Error checking whether ID exists: {:?}", err))
-                .and_then(move |(connection, result): (SharedConnection, bool)| {
-                    if result {
-                        Account::try_from(id, account)
-                            .and_then(move |account| Ok((connection, account)))
-                    } else {
+                .and_then(move |(connection, exists): (SharedConnection, bool)| {
+                    if !exists {
                         warn!(
                             "No account exists with ID {}, cannot update account {:?}",
-                            id, account
+                            account.id, account
                         );
-                        Err(())
+                        return Either::A(err(()));
                     }
-                })
-                .and_then(move |(connection, account)| {
                     let mut pipe = redis::pipe();
                     pipe.atomic();
 
                     // Add the account key to the list of accounts
-                    pipe.sadd("accounts", id).ignore();
+                    pipe.sadd("accounts", account.id).ignore();
 
                     // Set account details
                     pipe.cmd("HMSET")
                         .arg(accounts_key(account.id))
-                        .arg(
-                            account
-                                .clone()
-                                .encrypt_tokens(&encryption_key.expose_secret().0),
-                        )
+                        .arg(encrypted.clone())
                         .ignore();
 
                     if account.should_send_routes() {
@@ -402,7 +488,7 @@ impl RedisStore {
                         pipe.sadd("receive_routes_from", account.id).ignore();
                     }
 
-                    if account.btp_uri.is_some() {
+                    if account.ilp_over_btp_url.is_some() {
                         pipe.sadd("btp_outgoing", account.id).ignore();
                     }
 
@@ -414,20 +500,20 @@ impl RedisStore {
                     )
                     .ignore();
 
-                    pipe.query_async(connection)
-                        .map_err(|err| error!("Error inserting account into DB: {:?}", err))
-                        .and_then(move |(connection, _ret): (SharedConnection, Value)| {
-                            update_routes(connection, routing_table)
-                        })
-                        .and_then(move |_| {
-                            debug!(
-                                "Inserted account {} (ILP address: {})",
-                                account.id,
-                                str::from_utf8(account.ilp_address.as_ref())
-                                    .unwrap_or("<not utf8>")
-                            );
-                            Ok(account)
-                        })
+                    Either::B(
+                        pipe.query_async(connection)
+                            .map_err(|err| error!("Error inserting account into DB: {:?}", err))
+                            .and_then(move |(connection, _ret): (SharedConnection, Value)| {
+                                update_routes(connection, routing_table)
+                            })
+                            .and_then(move |_| {
+                                debug!(
+                                    "Inserted account {} (ILP address: {})",
+                                    account.id, account.ilp_address
+                                );
+                                Ok(encrypted)
+                            }),
+                    )
                 }),
         )
     }
@@ -435,52 +521,51 @@ impl RedisStore {
     fn redis_modify_account(
         &self,
         id: AccountId,
-        settings: AccountSettings,
-    ) -> Box<dyn Future<Item = Account, Error = ()> + Send> {
+        settings: EncryptedAccountSettings,
+    ) -> Box<dyn Future<Item = AccountWithEncryptedTokens, Error = ()> + Send> {
         let connection = self.connection.clone();
-        let encryption_key = self.encryption_key.clone();
         let self_clone = self.clone();
 
         let mut pipe = redis::pipe();
         pipe.atomic();
 
-        if let Some(ref endpoint) = settings.btp_uri {
-            pipe.hset(accounts_key(id), "btp_uri", endpoint);
+        if let Some(ref endpoint) = settings.ilp_over_btp_url {
+            pipe.hset(accounts_key(id), "ilp_over_btp_url", endpoint);
         }
 
-        if let Some(ref endpoint) = settings.http_endpoint {
-            pipe.hset(accounts_key(id), "http_endpoint", endpoint);
+        if let Some(ref endpoint) = settings.ilp_over_http_url {
+            pipe.hset(accounts_key(id), "ilp_over_http_url", endpoint);
         }
 
-        if let Some(ref token) = settings.btp_outgoing_token {
+        if let Some(ref token) = settings.ilp_over_btp_outgoing_token {
             pipe.hset(
                 accounts_key(id),
-                "btp_outgoing_token",
-                encrypt_token(&encryption_key.expose_secret().0, token.as_ref()).as_ref(),
+                "ilp_over_btp_outgoing_token",
+                token.as_ref(),
             );
         }
 
-        if let Some(ref token) = settings.http_outgoing_token {
+        if let Some(ref token) = settings.ilp_over_http_outgoing_token {
             pipe.hset(
                 accounts_key(id),
-                "http_outgoing_token",
-                encrypt_token(&encryption_key.expose_secret().0, token.as_ref()).as_ref(),
+                "ilp_over_http_outgoing_token",
+                token.as_ref(),
             );
         }
 
-        if let Some(ref token) = settings.btp_incoming_token {
+        if let Some(ref token) = settings.ilp_over_btp_incoming_token {
             pipe.hset(
                 accounts_key(id),
-                "btp_incoming_token",
-                encrypt_token(&encryption_key.expose_secret().0, token.as_ref()).as_ref(),
+                "ilp_over_btp_incoming_token",
+                token.as_ref(),
             );
         }
 
-        if let Some(ref token) = settings.http_incoming_token {
+        if let Some(ref token) = settings.ilp_over_http_incoming_token {
             pipe.hset(
                 accounts_key(id),
-                "http_incoming_token",
-                encrypt_token(&encryption_key.expose_secret().0, token.as_ref()).as_ref(),
+                "ilp_over_http_incoming_token",
+                token.as_ref(),
             );
         }
 
@@ -505,7 +590,7 @@ impl RedisStore {
     fn redis_get_account(
         &self,
         id: AccountId,
-    ) -> Box<dyn Future<Item = Account, Error = ()> + Send> {
+    ) -> Box<dyn Future<Item = AccountWithEncryptedTokens, Error = ()> + Send> {
         Box::new(
             self.redis_get_accounts(vec![id])
                 .and_then(|accounts| accounts.get(0).cloned().ok_or(())),
@@ -515,11 +600,11 @@ impl RedisStore {
     fn redis_delete_account(
         &self,
         id: AccountId,
-    ) -> Box<dyn Future<Item = Account, Error = ()> + Send> {
+    ) -> Box<dyn Future<Item = AccountWithEncryptedTokens, Error = ()> + Send> {
         let connection = self.connection.as_ref().clone();
         let routing_table = self.routes.clone();
-
-        Box::new(self.redis_get_account(id).and_then(|account| {
+        Box::new(self.redis_get_account(id).and_then(move |encrypted| {
+            let account = encrypted.account.clone();
             let mut pipe = redis::pipe();
             pipe.atomic();
 
@@ -536,7 +621,7 @@ impl RedisStore {
                 pipe.srem("receive_routes_from", account.id).ignore();
             }
 
-            if account.btp_uri.is_some() {
+            if account.ilp_over_btp_url.is_some() {
                 pipe.srem("btp_outgoing", account.id).ignore();
             }
 
@@ -550,7 +635,7 @@ impl RedisStore {
                 })
                 .and_then(move |_| {
                     debug!("Deleted account {}", account.id);
-                    Ok(account)
+                    Ok(encrypted)
                 })
         }))
     }
@@ -558,9 +643,7 @@ impl RedisStore {
     fn redis_get_accounts(
         &self,
         account_ids: Vec<AccountId>,
-    ) -> Box<dyn Future<Item = Vec<Account>, Error = ()> + Send> {
-        let decryption_key = self.decryption_key.clone();
-        let num_accounts = account_ids.len();
+    ) -> Box<dyn Future<Item = Vec<AccountWithEncryptedTokens>, Error = ()> + Send> {
         let mut pipe = redis::pipe();
         for account_id in account_ids.iter() {
             pipe.hgetall(accounts_key(*account_id));
@@ -574,19 +657,7 @@ impl RedisStore {
                     )
                 })
                 .and_then(
-                    move |(_conn, accounts): (_, Vec<AccountWithEncryptedTokens>)| {
-                        if accounts.len() == num_accounts {
-                            let accounts = accounts
-                                .into_iter()
-                                .map(|account| {
-                                    account.decrypt_tokens(&decryption_key.expose_secret().0)
-                                })
-                                .collect();
-                            Ok(accounts)
-                        } else {
-                            Err(())
-                        }
-                    },
+                    move |(_conn, accounts): (_, Vec<AccountWithEncryptedTokens>)| Ok(accounts),
                 ),
         )
     }
@@ -600,21 +671,81 @@ impl AccountStore for RedisStore {
         &self,
         account_ids: Vec<<Self::Account as AccountTrait>::AccountId>,
     ) -> Box<dyn Future<Item = Vec<Account>, Error = ()> + Send> {
-        self.redis_get_accounts(account_ids)
+        let decryption_key = self.decryption_key.clone();
+        let num_accounts = account_ids.len();
+        Box::new(
+            self.redis_get_accounts(account_ids)
+                .and_then(move |accounts| {
+                    if accounts.len() == num_accounts {
+                        let accounts = accounts
+                            .into_iter()
+                            .map(|account| {
+                                account.decrypt_tokens(&decryption_key.expose_secret().0)
+                            })
+                            .collect();
+                        Ok(accounts)
+                    } else {
+                        Err(())
+                    }
+                }),
+        )
     }
 
     fn get_account_id_from_username(
         &self,
         username: &Username,
     ) -> Box<dyn Future<Item = AccountId, Error = ()> + Send> {
+        let username = username.clone();
         Box::new(
             cmd("HGET")
                 .arg("usernames")
                 .arg(username.as_ref())
                 .query_async(self.connection.as_ref().clone())
                 .map_err(move |err| error!("Error getting account id: {:?}", err))
-                .and_then(|(_connection, id): (_, AccountId)| Ok(id)),
+                .and_then(|(_connection, id): (_, Option<AccountId>)| {
+                    id.ok_or_else(move || debug!("Username not found: {}", username))
+                }),
         )
+    }
+}
+
+impl StreamNotificationsStore for RedisStore {
+    type Account = Account;
+
+    fn add_payment_notification_subscription(
+        &self,
+        id: AccountId,
+        sender: UnboundedSender<PaymentNotification>,
+    ) {
+        trace!("Added payment notification listener for {}", id);
+        self.subscriptions.write().insert(id, sender);
+    }
+
+    fn publish_payment_notification(&self, payment: PaymentNotification) {
+        let username = payment.to_username.clone();
+        let message = serde_json::to_string(&payment).unwrap();
+        let connection = self.connection.as_ref().clone();
+        spawn(
+            self.get_account_id_from_username(&username)
+                .map_err(move |_| {
+                    error!(
+                        "Failed to find account ID corresponding to username: {}",
+                        username
+                    )
+                })
+                .and_then(move |account_id| {
+                    debug!("Publishing message {} for ID {}", message, account_id);
+                    redis::cmd("PUBLISH")
+                        .arg(format!("{}{}", STREAM_NOTIFICATIONS_PREFIX, account_id))
+                        .arg(message)
+                        .query_async(connection)
+                        .map_err(move |err| error!("Error publish message to Redis: {:?}", err))
+                        .and_then(move |(_, _): (_, i32)| {
+                            debug!("Successfully published message");
+                            Ok(())
+                        })
+                }),
+        );
     }
 }
 
@@ -791,7 +922,7 @@ impl BtpStore for RedisStore {
                     move |(_connection, account): (_, Option<AccountWithEncryptedTokens>)| {
                         if let Some(account) = account {
                             let account = account.decrypt_tokens(&decryption_key.expose_secret().0);
-                            if let Some(t) = account.btp_incoming_token.clone() {
+                            if let Some(t) = account.ilp_over_btp_incoming_token.clone() {
                                 let t = t.expose_secret().clone();
                                 if t == Bytes::from(token) {
                                     Ok(account)
@@ -882,7 +1013,7 @@ impl HttpStore for RedisStore {
                     move |(_connection, account): (_, Option<AccountWithEncryptedTokens>)| {
                         if let Some(account) = account {
                             let account = account.decrypt_tokens(&decryption_key.expose_secret().0);
-                            if let Some(t) = account.http_incoming_token.clone() {
+                            if let Some(t) = account.ilp_over_http_incoming_token.clone() {
                                 let t = t.expose_secret().clone();
                                 if t == Bytes::from(token) {
                                     Ok(account)
@@ -915,11 +1046,33 @@ impl NodeStore for RedisStore {
         &self,
         account: AccountDetails,
     ) -> Box<dyn Future<Item = Account, Error = ()> + Send> {
-        self.redis_insert_account(account)
+        let encryption_key = self.encryption_key.clone();
+        let id = AccountId::new();
+        let account = match Account::try_from(id, account, self.get_ilp_address()) {
+            Ok(account) => account,
+            Err(_) => return Box::new(err(())),
+        };
+        debug!(
+            "Generated account id for {}: {}",
+            account.username.clone(),
+            account.id
+        );
+        let encrypted = account
+            .clone()
+            .encrypt_tokens(&encryption_key.expose_secret().0);
+        Box::new(
+            self.redis_insert_account(encrypted)
+                .and_then(move |_| Ok(account)),
+        )
     }
 
     fn delete_account(&self, id: AccountId) -> Box<dyn Future<Item = Account, Error = ()> + Send> {
-        self.redis_delete_account(id)
+        let decryption_key = self.decryption_key.clone();
+        Box::new(
+            self.redis_delete_account(id).and_then(move |account| {
+                Ok(account.decrypt_tokens(&decryption_key.expose_secret().0))
+            }),
+        )
     }
 
     fn update_account(
@@ -927,7 +1080,26 @@ impl NodeStore for RedisStore {
         id: AccountId,
         account: AccountDetails,
     ) -> Box<dyn Future<Item = Self::Account, Error = ()> + Send> {
-        self.redis_update_account(id, account)
+        let encryption_key = self.encryption_key.clone();
+        let decryption_key = self.decryption_key.clone();
+        let account = match Account::try_from(id, account, self.get_ilp_address()) {
+            Ok(account) => account,
+            Err(_) => return Box::new(err(())),
+        };
+        debug!(
+            "Generated account id for {}: {}",
+            account.username.clone(),
+            account.id
+        );
+        let encrypted = account
+            .clone()
+            .encrypt_tokens(&encryption_key.expose_secret().0);
+        Box::new(
+            self.redis_update_account(encrypted)
+                .and_then(move |account| {
+                    Ok(account.decrypt_tokens(&decryption_key.expose_secret().0))
+                }),
+        )
     }
 
     fn modify_account_settings(
@@ -935,7 +1107,45 @@ impl NodeStore for RedisStore {
         id: <Self::Account as AccountTrait>::AccountId,
         settings: AccountSettings,
     ) -> Box<dyn Future<Item = Self::Account, Error = ()> + Send> {
-        self.redis_modify_account(id, settings)
+        let encryption_key = self.encryption_key.clone();
+        let decryption_key = self.decryption_key.clone();
+        let settings = EncryptedAccountSettings {
+            settle_to: settings.settle_to,
+            settle_threshold: settings.settle_threshold,
+            ilp_over_btp_url: settings.ilp_over_btp_url,
+            ilp_over_http_url: settings.ilp_over_http_url,
+            ilp_over_btp_incoming_token: settings.ilp_over_btp_incoming_token.map(|token| {
+                encrypt_token(
+                    &encryption_key.expose_secret().0,
+                    token.expose_secret().as_bytes(),
+                )
+            }),
+            ilp_over_http_incoming_token: settings.ilp_over_http_incoming_token.map(|token| {
+                encrypt_token(
+                    &encryption_key.expose_secret().0,
+                    token.expose_secret().as_bytes(),
+                )
+            }),
+            ilp_over_btp_outgoing_token: settings.ilp_over_btp_outgoing_token.map(|token| {
+                encrypt_token(
+                    &encryption_key.expose_secret().0,
+                    token.expose_secret().as_bytes(),
+                )
+            }),
+            ilp_over_http_outgoing_token: settings.ilp_over_http_outgoing_token.map(|token| {
+                encrypt_token(
+                    &encryption_key.expose_secret().0,
+                    token.expose_secret().as_bytes(),
+                )
+            }),
+        };
+
+        Box::new(
+            self.redis_modify_account(id, settings)
+                .and_then(move |account| {
+                    Ok(account.decrypt_tokens(&decryption_key.expose_secret().0))
+                }),
+        )
     }
 
     // TODO limit the number of results and page through them
@@ -1039,6 +1249,88 @@ impl NodeStore for RedisStore {
                     })
             })
         )
+    }
+}
+
+impl AddressStore for RedisStore {
+    // Updates the ILP address of the store & iterates over all children and
+    // updates their ILP Address to match the new address.
+    fn set_ilp_address(
+        &self,
+        ilp_address: Address,
+    ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+        let self_clone = self.clone();
+        let routing_table = self.routes.clone();
+        let conn = self.connection.clone();
+        let ilp_address_clone = ilp_address.clone();
+        Box::new(
+            cmd("SET")
+                .arg(PARENT_ILP_KEY)
+                .arg(ilp_address.as_bytes())
+                .query_async(self.connection.as_ref().clone())
+                .map_err(|err| error!("Error setting static ilp address {:?}", err))
+                .and_then(move |(_, _): (SharedConnection, Value)| {
+                    *(self_clone.ilp_address.write()) = ilp_address;
+                    Ok(())
+                })
+                .join(self.get_all_accounts().and_then(move |accounts| {
+                    // TODO: This can be an expensive operation if this function
+                    // gets called often. This currently only gets called when
+                    // inserting a new parent account in the API. It'd be nice
+                    // if we could generate a child's ILP address on the fly,
+                    // instead of having to store the username appended to the
+                    // node's ilp address. Currently this is not possible, as
+                    // account.ilp_address() cannot access any state that exists
+                    // on the store.
+                    let mut pipe = redis::pipe();
+                    for account in accounts {
+                        // Update the address and routes of all children.
+                        if account.routing_relation() == RoutingRelation::Child {
+                            // remove the old route
+                            pipe.hdel(ROUTES_KEY, account.ilp_address.as_bytes())
+                                .ignore();
+
+                            let new_ilp_address = ilp_address_clone
+                                .with_suffix(account.username().as_bytes())
+                                .unwrap();
+                            pipe.hset(
+                                accounts_key(account.id()),
+                                "ilp_address",
+                                new_ilp_address.as_bytes(),
+                            )
+                            .ignore();
+
+                            pipe.hset(ROUTES_KEY, new_ilp_address.as_bytes(), account.id())
+                                .ignore();
+                        }
+                    }
+                    pipe.query_async(conn.as_ref().clone())
+                        .map_err(|err| error!("Error updating children: {:?}", err))
+                        .and_then(move |(connection, _): (SharedConnection, Value)| {
+                            update_routes(connection, routing_table)
+                        })
+                }))
+                .and_then(move |_| Ok(())),
+        )
+    }
+
+    fn clear_ilp_address(&self) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+        let self_clone = self.clone();
+        Box::new(
+            cmd("DEL")
+                .arg(PARENT_ILP_KEY)
+                .query_async(self.connection.as_ref().clone())
+                .map_err(|err| error!("Error removing parent address: {:?}", err))
+                .and_then(move |(_, _): (SharedConnection, Value)| {
+                    *(self_clone.ilp_address.write()) = DEFAULT_ILP_ADDRESS.clone();
+                    Ok(())
+                }),
+        )
+    }
+
+    fn get_ilp_address(&self) -> Address {
+        // read consumes the Arc<RwLock<T>> so we cannot return a reference
+        self.ilp_address.read().clone()
     }
 }
 
