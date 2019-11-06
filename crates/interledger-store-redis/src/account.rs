@@ -82,16 +82,16 @@ impl Account {
     pub fn try_from(
         id: AccountId,
         details: AccountDetails,
-        parent_ilp_address: Address,
+        node_ilp_address: Address,
     ) -> Result<Account, ()> {
         let ilp_address = match details.ilp_address {
             Some(a) => a,
-            None => parent_ilp_address
+            None => node_ilp_address
                 .with_suffix(details.username.as_bytes())
                 .map_err(|_| {
                     error!(
                         "Could not append username {} to address {}",
-                        details.username, parent_ilp_address
+                        details.username, node_ilp_address
                     )
                 })?,
         };
@@ -154,7 +154,7 @@ impl Account {
 
     pub fn encrypt_tokens(
         mut self,
-        encryption_key: &aead::SealingKey,
+        encryption_key: &aead::LessSafeKey,
     ) -> AccountWithEncryptedTokens {
         if let Some(ref token) = self.ilp_over_btp_outgoing_token {
             self.ilp_over_btp_outgoing_token = Some(SecretBytes::from(encrypt_token(
@@ -190,22 +190,50 @@ pub struct AccountWithEncryptedTokens {
 }
 
 impl AccountWithEncryptedTokens {
-    pub fn decrypt_tokens(mut self, decryption_key: &aead::OpeningKey) -> Account {
+    pub fn decrypt_tokens(mut self, decryption_key: &aead::LessSafeKey) -> Account {
         if let Some(ref encrypted) = self.account.ilp_over_btp_outgoing_token {
             self.account.ilp_over_btp_outgoing_token =
-                decrypt_token(decryption_key, &encrypted.expose_secret()).map(SecretBytes::from);
+                decrypt_token(decryption_key, &encrypted.expose_secret())
+                    .map_err(|_| {
+                        error!(
+                            "Unable to decrypt ilp_over_btp_outgoing_token for account {}",
+                            self.account.id
+                        )
+                    })
+                    .ok();
         }
         if let Some(ref encrypted) = self.account.ilp_over_http_outgoing_token {
             self.account.ilp_over_http_outgoing_token =
-                decrypt_token(decryption_key, &encrypted.expose_secret()).map(SecretBytes::from);
+                decrypt_token(decryption_key, &encrypted.expose_secret())
+                    .map_err(|_| {
+                        error!(
+                            "Unable to decrypt ilp_over_http_outgoing_token for account {}",
+                            self.account.id
+                        )
+                    })
+                    .ok();
         }
         if let Some(ref encrypted) = self.account.ilp_over_btp_incoming_token {
             self.account.ilp_over_btp_incoming_token =
-                decrypt_token(decryption_key, &encrypted.expose_secret()).map(SecretBytes::from);
+                decrypt_token(decryption_key, &encrypted.expose_secret())
+                    .map_err(|_| {
+                        error!(
+                            "Unable to decrypt ilp_over_btp_incoming_token for account {}",
+                            self.account.id
+                        )
+                    })
+                    .ok();
         }
         if let Some(ref encrypted) = self.account.ilp_over_http_incoming_token {
             self.account.ilp_over_http_incoming_token =
-                decrypt_token(decryption_key, &encrypted.expose_secret()).map(SecretBytes::from);
+                decrypt_token(decryption_key, &encrypted.expose_secret())
+                    .map_err(|_| {
+                        error!(
+                            "Unable to decrypt ilp_over_http_incoming_token for account {}",
+                            self.account.id
+                        )
+                    })
+                    .ok();
         }
 
         self.account

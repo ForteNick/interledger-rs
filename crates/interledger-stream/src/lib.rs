@@ -11,7 +11,7 @@ mod error;
 mod packet;
 mod server;
 
-pub use client::send_money;
+pub use client::{send_money, StreamDelivery};
 pub use error::Error;
 pub use server::{
     ConnectionGenerator, PaymentNotification, StreamNotificationsStore, StreamReceiverService,
@@ -20,15 +20,15 @@ pub use server::{
 #[cfg(test)]
 pub mod test_helpers {
     use super::*;
-    use bytes::Bytes;
     use futures::{future::ok, sync::mpsc::UnboundedSender, Future};
     use interledger_packet::Address;
     use interledger_router::RouterStore;
-    use interledger_service::{Account, AccountStore, Username};
+    use interledger_service::{Account, AccountStore, AddressStore, Username};
     use lazy_static::lazy_static;
     use std::collections::HashMap;
     use std::iter::FromIterator;
     use std::str::FromStr;
+    use std::sync::Arc;
 
     lazy_static! {
         pub static ref EXAMPLE_CONNECTOR: Address = Address::from_str("example.connector").unwrap();
@@ -86,7 +86,7 @@ pub mod test_helpers {
 
     #[derive(Clone)]
     pub struct TestStore {
-        pub route: (Bytes, TestAccount),
+        pub route: (String, TestAccount),
     }
 
     impl AccountStore for TestStore {
@@ -109,8 +109,29 @@ pub mod test_helpers {
     }
 
     impl RouterStore for TestStore {
-        fn routing_table(&self) -> HashMap<Bytes, u64> {
-            HashMap::from_iter(vec![(self.route.0.clone(), self.route.1.id())].into_iter())
+        fn routing_table(&self) -> Arc<HashMap<String, u64>> {
+            Arc::new(HashMap::from_iter(
+                vec![(self.route.0.clone(), self.route.1.id())].into_iter(),
+            ))
+        }
+    }
+
+    impl AddressStore for TestStore {
+        /// Saves the ILP Address in the store's memory and database
+        fn set_ilp_address(
+            &self,
+            _ilp_address: Address,
+        ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+            unimplemented!()
+        }
+
+        fn clear_ilp_address(&self) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+            unimplemented!()
+        }
+
+        /// Get's the store's ilp address from memory
+        fn get_ilp_address(&self) -> Address {
+            Address::from_str("example.connector").unwrap()
         }
     }
 }
@@ -140,7 +161,7 @@ mod send_money_to_receiver {
             asset_scale: 9,
         };
         let store = TestStore {
-            route: (destination_address.to_bytes(), account),
+            route: (destination_address.to_string(), account),
         };
         let connection_generator = ConnectionGenerator::new(server_secret.clone());
         let server = StreamReceiverService::new(
@@ -156,7 +177,7 @@ mod send_money_to_receiver {
                 .build())
             }),
         );
-        let server = Router::new(EXAMPLE_RECEIVER.clone(), store, server);
+        let server = Router::new(store, server);
         let server = IldcpService::new(server);
 
         let (destination_account, shared_secret) =
@@ -175,8 +196,8 @@ mod send_money_to_receiver {
             &shared_secret[..],
             100,
         )
-        .and_then(|(delivered_amount, _service)| {
-            assert_eq!(delivered_amount, 100);
+        .and_then(|(receipt, _service)| {
+            assert_eq!(receipt.delivered_amount, 100);
             Ok(())
         })
         .map_err(|err| panic!(err));

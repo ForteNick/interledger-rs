@@ -1,23 +1,37 @@
 use futures::{stream::Stream, Future};
+use hex;
+use interledger::stream::StreamDelivery;
 use interledger::{
     packet::Address,
     service::Account as AccountTrait,
     store_redis::{Account, AccountId},
 };
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::str;
+use tracing_subscriber;
 
-#[derive(serde::Deserialize)]
-pub struct DeliveryData {
-    pub delivered_amount: u64,
+pub fn install_tracing_subscriber() {
+    tracing_subscriber::fmt::Subscriber::builder()
+        .with_timer(tracing_subscriber::fmt::time::ChronoUtc::rfc3339())
+        .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
+        .try_init()
+        .unwrap_or(());
+}
+
+#[allow(unused)]
+pub fn random_secret() -> String {
+    let mut bytes: [u8; 32] = [0; 32];
+    SystemRandom::new().fill(&mut bytes).unwrap();
+    hex::encode(bytes)
 }
 
 #[derive(serde::Deserialize)]
 pub struct BalanceData {
-    pub balance: String,
+    pub balance: i64,
 }
 
 #[allow(unused)]
@@ -68,7 +82,7 @@ pub fn send_money_to_username<T: Display + Debug>(
     to_username: T,
     from_username: &str,
     from_auth: &str,
-) -> impl Future<Item = u64, Error = ()> {
+) -> impl Future<Item = StreamDelivery, Error = ()> {
     let client = reqwest::r#async::Client::new();
     let auth = format!("{}:{}", from_username, from_auth);
     client
@@ -88,8 +102,8 @@ pub fn send_money_to_username<T: Display + Debug>(
             eprintln!("Error sending SPSP payment: {:?}", err);
         })
         .and_then(move |body| {
-            let ret: DeliveryData = serde_json::from_slice(&body).unwrap();
-            Ok(ret.delivered_amount)
+            let ret: StreamDelivery = serde_json::from_slice(&body).unwrap();
+            Ok(ret)
         })
 }
 
@@ -144,6 +158,6 @@ pub fn get_balance<T: Display>(
         })
         .and_then(|body| {
             let ret: BalanceData = serde_json::from_slice(&body).unwrap();
-            Ok(ret.balance.parse().unwrap())
+            Ok(ret.balance)
         })
 }

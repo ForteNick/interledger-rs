@@ -1,11 +1,6 @@
 #![recursion_limit = "128"]
 
-#[macro_use]
-extern crate tower_web;
-
-use bytes::Bytes;
 use futures::Future;
-use hyper::StatusCode;
 use interledger_packet::Address;
 use interledger_service::Account;
 use lazy_static::lazy_static;
@@ -20,9 +15,13 @@ mod message_service;
 #[cfg(test)]
 mod test_helpers;
 use num_bigint::BigUint;
+use serde::{Deserialize, Serialize};
 use std::ops::{Div, Mul};
 
-pub use api::SettlementApi;
+pub use api::{
+    create_settlements_filter, scale_with_precision_loss, CONVERSION_ERROR_TYPE,
+    NO_ENGINE_CONFIGURED_ERROR_TYPE,
+};
 pub use client::SettlementClient;
 pub use message_service::SettlementMessageService;
 
@@ -30,7 +29,7 @@ lazy_static! {
     pub static ref SE_ILP_ADDRESS: Address = Address::from_str("peer.settle").unwrap();
 }
 
-#[derive(Extract, Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Quantity {
     pub amount: String,
     pub scale: u8,
@@ -77,25 +76,33 @@ pub trait SettlementStore {
     ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
 }
 
-pub type IdempotentData = (StatusCode, Bytes, [u8; 32]);
+pub trait LeftoversStore {
+    type AccountId;
+    type AssetType: ToString;
 
-pub trait IdempotentStore {
-    /// Returns the API response that was saved when the idempotency key was used
-    /// Also returns a hash of the input data which resulted in the response
-    fn load_idempotent_data(
+    /// Saves the leftover data
+    fn save_uncredited_settlement_amount(
         &self,
-        idempotency_key: String,
-    ) -> Box<dyn Future<Item = Option<IdempotentData>, Error = ()> + Send>;
-
-    /// Saves the data that was passed along with the api request for later
-    /// The store MUST also save a hash of the input, so that it errors out on requests
-    fn save_idempotent_data(
-        &self,
-        idempotency_key: String,
-        input_hash: [u8; 32],
-        status_code: StatusCode,
-        data: Bytes,
+        // The account id that for which there was a precision loss
+        account_id: Self::AccountId,
+        // The amount for which precision loss occurred, along with their scale
+        uncredited_settlement_amount: (Self::AssetType, u8),
     ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
+
+    /// Returns the leftover data scaled to `local_scale` from the saved scale.
+    /// If any precision loss occurs during the scaling, it should be saved as
+    /// the new leftover value.
+    fn load_uncredited_settlement_amount(
+        &self,
+        account_id: Self::AccountId,
+        local_scale: u8,
+    ) -> Box<dyn Future<Item = Self::AssetType, Error = ()> + Send>;
+
+    // Gets the current amount of leftovers in the store
+    fn get_uncredited_settlement_amount(
+        &self,
+        account_id: Self::AccountId,
+    ) -> Box<dyn Future<Item = (Self::AssetType, u8), Error = ()> + Send>;
 }
 
 #[derive(Debug)]

@@ -99,6 +99,12 @@ else
         fi
     done
 fi
+
+# Aliases don't play nicely with scripts, so this is our faux-alias
+function ilp-cli {
+    cargo run --quiet --bin ilp-cli -- $@
+}
+
 -->
 
 ### 1. Build interledger.rs
@@ -115,7 +121,7 @@ else
     printf "Building interledger.rs... (This may take a couple of minutes)\n"
 -->
 ```bash
-cargo build --all-features --bin ilp-node --bin interledger-settlement-engines
+cargo build --all-features --bin ilp-node
 ```
 <!--!
 fi
@@ -192,6 +198,8 @@ sleep 3
 ### 4. Launch Settlement Engines
 Because each node needs its own settlement engine, we need to launch both a settlement engine for Alice's node and another settlement engine for Bob's node.
 
+Note: The engines are part of a [separate repository](https://github.com/interledger-rs/settlement-engines) so you have to clone and install them according to [the instructions](https://github.com/interledger-rs/settlement-engines/blob/master/README.md)
+
 <!--!
 printf "\nStarting settlement engines...\n"
 if [ "$USE_DOCKER" -eq 1 ]; then
@@ -201,7 +209,7 @@ if [ "$USE_DOCKER" -eq 1 ]; then
         --network=interledger \
         --name=interledger-rs-se_a \
         -td \
-        interledgerrs/settlement-engine ethereum-ledger \
+        interledgerrs/settlement-engines ethereum-ledger \
         --private_key 380eb0f3d505f087e438eca80bc4df9a7faa24f868e69fc0440261a0fc0567dc \
         --confirmations 0 \
         --poll_frequency 1000 \
@@ -216,7 +224,7 @@ if [ "$USE_DOCKER" -eq 1 ]; then
         --network=interledger \
         --name=interledger-rs-se_b \
         -td \
-        interledgerrs/settlement-engine ethereum-ledger \
+        interledgerrs/settlement-engines ethereum-ledger \
         --private_key cc96601bc52293b53c4736a12af9130abf347669b3813f9ec4cafdf6991b087e \
         --confirmations 0 \
         --poll_frequency 1000 \
@@ -230,9 +238,11 @@ else
 ```bash
 # Turn on debug logging for all of the interledger.rs components
 export RUST_LOG=interledger=debug
+git clone https://github.com/interledger-rs/settlement-engines
+cd settlement-engines
 
 # Start Alice's settlement engine
-cargo run --all-features --bin interledger-settlement-engines -- ethereum-ledger \
+cargo run --features "ethereum" -- ethereum-ledger \
 --private_key 380eb0f3d505f087e438eca80bc4df9a7faa24f868e69fc0440261a0fc0567dc \
 --confirmations 0 \
 --poll_frequency 1000 \
@@ -243,7 +253,7 @@ cargo run --all-features --bin interledger-settlement-engines -- ethereum-ledger
 &> logs/node-alice-settlement-engine.log &
 
 # Start Bob's settlement engine
-cargo run --all-features --bin interledger-settlement-engines -- ethereum-ledger \
+cargo run --features "ethereum" -- ethereum-ledger \
 --private_key cc96601bc52293b53c4736a12af9130abf347669b3813f9ec4cafdf6991b087e \
 --confirmations 0 \
 --poll_frequency 1000 \
@@ -252,6 +262,8 @@ cargo run --all-features --bin interledger-settlement-engines -- ethereum-ledger
 --redis_url redis://127.0.0.1:6382/ \
 --settlement_api_bind_address 127.0.0.1:3001 \
 &> logs/node-bob-settlement-engine.log &
+
+cd ..
 ```
 
 <!--!
@@ -410,77 +422,62 @@ else
 -->
 
 ```bash
+# This alias makes our CLI invocations more natural
+alias ilp-cli="cargo run --quiet --bin ilp-cli --"
+
+export ILP_CLI_API_AUTH=hi_alice
 # Adding settlement accounts should be done at the same time because it checks each other
 
 printf "Adding Alice's account...\n"
-curl \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer hi_alice" \
-    -d '{
-    "username": "alice",
-    "ilp_address": "example.alice",
-    "asset_code": "ETH",
-    "asset_scale": 18,
-    "max_packet_amount": 100,
-    "ilp_over_http_incoming_token": "in_alice",
-    "ilp_over_http_url": "http://localhost:7770/ilp",
-    "settle_to" : 0}' \
-    http://localhost:7770/accounts > logs/account-alice-alice.log 2>/dev/null
+ilp-cli accounts create alice \
+    --ilp-address example.alice \
+    --asset-code ETH \
+    --asset-scale 18 \
+    --max-packet-amount 100 \
+    --ilp-over-http-incoming-token in_alice \
+    --ilp-over-http-url http://localhost:7770/ilp \
+    --settle-to 0 > logs/account-alice-alice.log
 
 printf "Adding Bob's Account...\n"
-curl \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer hi_bob" \
-    -d '{
-    "username": "bob",
-    "ilp_address": "example.bob",
-    "asset_code": "ETH",
-    "asset_scale": 18,
-    "max_packet_amount": 100,
-    "ilp_over_http_incoming_token": "in_bob",
-    "ilp_over_http_url": "http://localhost:8770/ilp",
-    "settle_to" : 0}' \
-    http://localhost:8770/accounts > logs/account-bob-bob.log 2>/dev/null
+ilp-cli --node http://localhost:8770 accounts create bob \
+    --auth hi_bob \
+    --ilp-address example.bob \
+    --asset-code ETH \
+    --asset-scale 18 \
+    --max-packet-amount 100 \
+    --ilp-over-http-incoming-token in_bob \
+    --ilp-over-http-url http://localhost:8770/ilp \
+    --settle-to 0 > logs/account-bob-bob.log
 
 printf "Adding Bob's account on Alice's node...\n"
-curl \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer hi_alice" \
-    -d '{
-    "ilp_address": "example.bob",
-    "username": "bob",
-    "asset_code": "ETH",
-    "asset_scale": 18,
-    "max_packet_amount": 100,
-    "settlement_engine_url": "http://localhost:3000",
-    "ilp_over_http_incoming_token": "bob_password",
-    "ilp_over_http_outgoing_token": "alice:alice_password",
-    "ilp_over_http_url": "http://localhost:8770/ilp",
-    "settle_threshold": 500,
-    "min_balance": -1000,
-    "settle_to" : 0,
-    "routing_relation": "Peer"}' \
-    http://localhost:7770/accounts > logs/account-alice-bob.log 2>/dev/null &
+ilp-cli accounts create bob \
+    --ilp-address example.bob \
+    --asset-code ETH \
+    --asset-scale 18 \
+    --max-packet-amount 100 \
+    --settlement-engine-url http://localhost:3000 \
+    --ilp-over-http-incoming-token bob_password \
+    --ilp-over-http-outgoing-token alice:alice_password \
+    --ilp-over-http-url http://localhost:8770/ilp \
+    --settle-threshold 500 \
+    --min-balance -1000 \
+    --settle-to 0 \
+    --routing-relation Peer > logs/account-alice-bob.log &
 
 printf "Adding Alice's account on Bob's node...\n"
-curl \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer hi_bob" \
-    -d '{
-    "ilp_address": "example.alice",
-    "username": "alice",
-    "asset_code": "ETH",
-    "asset_scale": 18,
-    "max_packet_amount": 100,
-    "settlement_engine_url": "http://localhost:3001",
-    "ilp_over_http_incoming_token": "alice_password",
-    "ilp_over_http_outgoing_token": "bob:bob_password",
-    "ilp_over_http_url": "http://localhost:7770/ilp",
-    "settle_threshold": 500,
-    "min_balance": -1000,
-    "settle_to" : 0,
-    "routing_relation": "Peer"}' \
-    http://localhost:8770/accounts > logs/account-bob-alice.log 2>/dev/null &
+ilp-cli --node http://localhost:8770 accounts create alice \
+    --auth hi_bob \
+    --ilp-address example.alice \
+    --asset-code ETH \
+    --asset-scale 18 \
+    --max-packet-amount 100 \
+    --settlement-engine-url http://localhost:3000 \
+    --ilp-over-http-incoming-token alice_password \
+    --ilp-over-http-outgoing-token bob:bob_password \
+    --ilp-over-http-url http://localhost:7770/ilp \
+    --settle-threshold 500 \
+    --settle-to 0 \
+    --routing-relation Peer > logs/account-bob-alice.log &
 
 sleep 2
 ```
@@ -500,24 +497,18 @@ The `settle_threshold` and `settle_to` parameters control when settlements are t
 printf "\nChecking balances...\n"
 
 printf "\nAlice's balance on Alice's node: "
-curl \
--H "Authorization: Bearer alice:in_alice" \
-http://localhost:7770/accounts/alice/balance
+ilp-cli accounts balance alice
 
 printf "\nBob's balance on Alice's node: "
-curl \
--H "Authorization: Bearer bob:bob_password" \
-http://localhost:7770/accounts/bob/balance
+ilp-cli accounts balance bob
 
 printf "\nAlice's balance on Bob's node: "
-curl \
--H "Authorization: Bearer alice:alice_password" \
-http://localhost:8770/accounts/alice/balance
+ilp-cli --node http://localhost:8770 accounts balance alice \
+    --auth alice:alice_password
 
 printf "\nBob's balance on Bob's node: "
-curl \
--H "Authorization: Bearer bob:in_bob" \
-http://localhost:8770/accounts/bob/balance
+ilp-cli --node http://localhost:8770 accounts balance bob \
+    --auth bob:in_bob
 
 printf "\n\n"
 -->
@@ -536,11 +527,9 @@ if [ "$USE_DOCKER" -eq 1 ]; then
 else
 -->
 ```bash
-curl \
-    -H "Authorization: Bearer alice:in_alice" \
-    -H "Content-Type: application/json" \
-    -d "{\"receiver\":\"http://localhost:8770/accounts/bob/spsp\",\"source_amount\":500}" \
-    http://localhost:7770/accounts/alice/payments
+ilp-cli pay alice --auth in_alice \
+    --amount 500 \
+    --to http://localhost:8770/accounts/bob/spsp
 ```
 <!--!
 fi
@@ -557,24 +546,18 @@ printf "done\n"
 
 ```bash #
 printf "\nAlice's balance on Alice's node: "
-curl \
--H "Authorization: Bearer alice:in_alice" \
-http://localhost:7770/accounts/alice/balance
+ilp-cli accounts balance alice
 
 printf "\nBob's balance on Alice's node: "
-curl \
--H "Authorization: Bearer bob:bob_password" \
-http://localhost:7770/accounts/bob/balance
+ilp-cli accounts balance bob
 
 printf "\nAlice's balance on Bob's node: "
-curl \
--H "Authorization: Bearer alice:alice_password" \
-http://localhost:8770/accounts/alice/balance
+ilp-cli --node http://localhost:8770 accounts balance alice \
+    --auth alice:alice_password
 
 printf "\nBob's balance on Bob's node: "
-curl \
--H "Authorization: Bearer bob:in_bob" \
-http://localhost:8770/accounts/bob/balance
+ilp-cli --node http://localhost:8770 accounts balance bob \
+    --auth bob:in_bob
 ```
 
 <!--!

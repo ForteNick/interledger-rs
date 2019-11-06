@@ -7,12 +7,21 @@ use std::{
     io::Read,
     vec::Vec,
 };
+use tracing_subscriber::{
+    filter::EnvFilter,
+    fmt::{time::ChronoUtc, Subscriber},
+};
 
+mod metrics;
 mod node;
+mod trace;
 use node::InterledgerNode;
 
 pub fn main() {
-    env_logger::init();
+    Subscriber::builder()
+        .with_timer(ChronoUtc::rfc3339())
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
 
     // The naming convention of arguments
     //
@@ -80,7 +89,6 @@ pub fn main() {
         Arg::with_name("exchange_rate_provider")
             .long("exchange_rate_provider")
             .takes_value(true)
-            .possible_values(&["CoinCap"])
             .help("Exchange rate API to poll for exchange rates. If this is not set, the node will not poll for rates and will instead use the rates set via the HTTP API. \
                 Note that CryptoCompare can also be used when the node is configured via a config file or stdin, because an API key must be provided to use that service."),
         Arg::with_name("exchange_rate_poll_interval")
@@ -190,7 +198,7 @@ fn merge_args(config: &mut Config, matches: &ArgMatches) {
 fn get_env_config(prefix: &str) -> Config {
     let mut config = Config::new();
     config
-        .merge(config::Environment::with_prefix(prefix))
+        .merge(config::Environment::with_prefix(prefix).separator("__"))
         .unwrap();
 
     if prefix.to_lowercase() == "ilp" {

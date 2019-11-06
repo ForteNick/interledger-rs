@@ -87,7 +87,7 @@ impl ConnectionGenerator {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PaymentNotification {
     pub to_username: Username,
     pub from_username: Username,
@@ -168,18 +168,23 @@ where
         if dest.starts_with(to_address.as_ref()) {
             if let Ok(shared_secret) = self.connection_generator.rederive_secret(&destination) {
                 return Box::new(
-                    result(receive_money(&shared_secret, &to_address, request.prepare)).and_then(
-                        move |fulfill| {
-                            store.publish_payment_notification(PaymentNotification {
-                                to_username,
-                                from_username,
-                                amount,
-                                destination: destination.clone(),
-                                timestamp: DateTime::<Utc>::from(SystemTime::now()).to_rfc3339(),
-                            });
-                            Ok(fulfill)
-                        },
-                    ),
+                    result(receive_money(
+                        &shared_secret,
+                        &to_address,
+                        request.to.asset_code(),
+                        request.to.asset_scale(),
+                        request.prepare,
+                    ))
+                    .and_then(move |fulfill| {
+                        store.publish_payment_notification(PaymentNotification {
+                            to_username,
+                            from_username,
+                            amount,
+                            destination: destination.clone(),
+                            timestamp: DateTime::<Utc>::from(SystemTime::now()).to_rfc3339(),
+                        });
+                        Ok(fulfill)
+                    }),
                 );
             }
         }
@@ -190,7 +195,11 @@ where
 // TODO send asset code and scale back to sender also
 fn receive_money(
     shared_secret: &[u8; 32],
+    // Our node's ILP Address ( we are the receiver, so we should return that
+    // plus any other relevant information in our prepare packet's frames)
     ilp_address: &Address,
+    asset_code: &str,
+    asset_scale: u8,
     prepare: Prepare,
 ) -> Result<Fulfill, Reject> {
     // Generate fulfillment
@@ -219,12 +228,23 @@ fn receive_money(
     // TODO reject if they send data?
     for frame in stream_packet.frames() {
         // Tell the sender the stream can handle lots of money
-        if let Frame::StreamMoney(frame) = frame {
+        if let Frame::StreamMoney(ref frame) = frame {
             response_frames.push(Frame::StreamMaxMoney(StreamMaxMoneyFrame {
                 stream_id: frame.stream_id,
                 // TODO will returning zero here cause problems?
                 total_received: 0,
                 receive_max: u64::max_value(),
+            }));
+        }
+
+        // If we receive a ConnectionNewAddress frame, then send them our asset
+        // code & scale. The client is suppoesd to only send the
+        // ConnectionNewAddress frame once, so we expect that we will only have
+        // to respond with the ConnectionAssetDetails frame only one time.
+        if let Frame::ConnectionNewAddress(_) = frame {
+            response_frames.push(Frame::ConnectionAssetDetails(ConnectionAssetDetailsFrame {
+                source_asset_code: asset_code,
+                source_asset_scale: asset_scale,
             }));
         }
     }
@@ -239,7 +259,8 @@ fn receive_money(
         }
         .build();
         debug!(
-            "Fulfilling prepare with fulfillment: {} and encrypted stream packet: {:?}",
+            "Fulfilling prepare for amount {} with fulfillment: {} and encrypted stream packet: {:?}",
+            prepare_amount,
             hex::encode(&fulfillment[..]),
             response_packet
         );
@@ -369,7 +390,7 @@ mod receiving_money {
         let shared_secret = connection_generator
             .rederive_secret(&prepare.destination())
             .unwrap();
-        let result = receive_money(&shared_secret, &ilp_address, prepare);
+        let result = receive_money(&shared_secret, &ilp_address, "ABC", 9, prepare);
         assert!(result.is_ok());
     }
 
@@ -397,7 +418,7 @@ mod receiving_money {
         let shared_secret = connection_generator
             .rederive_secret(&prepare.destination())
             .unwrap();
-        let result = receive_money(&shared_secret, &ilp_address, prepare);
+        let result = receive_money(&shared_secret, &ilp_address, "ABC", 9, prepare);
         assert!(result.is_ok());
     }
 
@@ -426,7 +447,7 @@ mod receiving_money {
         let shared_secret = connection_generator
             .rederive_secret(&prepare.destination())
             .unwrap();
-        let result = receive_money(&shared_secret, &ilp_address, prepare);
+        let result = receive_money(&shared_secret, &ilp_address, "ABC", 9, prepare);
         assert!(result.is_err());
     }
 
@@ -465,7 +486,7 @@ mod receiving_money {
         let shared_secret = connection_generator
             .rederive_secret(&prepare.destination())
             .unwrap();
-        let result = receive_money(&shared_secret, &ilp_address, prepare);
+        let result = receive_money(&shared_secret, &ilp_address, "ABC", 9, prepare);
         assert!(result.is_err());
     }
 }

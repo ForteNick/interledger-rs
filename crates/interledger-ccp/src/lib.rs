@@ -9,11 +9,10 @@
 //! updates are used by the `Router` to forward incoming packets to the best next hop
 //! we know about.
 
-use bytes::Bytes;
 use futures::Future;
 use interledger_service::Account;
 use std::collections::HashMap;
-use std::{str::FromStr, string::ToString};
+use std::{fmt, str::FromStr};
 
 #[cfg(test)]
 mod fixtures;
@@ -59,14 +58,20 @@ impl FromStr for RoutingRelation {
     }
 }
 
-impl ToString for RoutingRelation {
-    fn to_string(&self) -> String {
+impl AsRef<str> for RoutingRelation {
+    fn as_ref(&self) -> &'static str {
         match self {
-            RoutingRelation::NonRoutingAccount => "NonRoutingAccount".to_string(),
-            RoutingRelation::Parent => "Parent".to_string(),
-            RoutingRelation::Peer => "Peer".to_string(),
-            RoutingRelation::Child => "Child".to_string(),
+            RoutingRelation::NonRoutingAccount => "NonRoutingAccount",
+            RoutingRelation::Parent => "Parent",
+            RoutingRelation::Peer => "Peer",
+            RoutingRelation::Child => "Child",
         }
+    }
+}
+
+impl fmt::Display for RoutingRelation {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.as_ref())
     }
 }
 
@@ -89,8 +94,8 @@ pub trait CcpRoutingAccount: Account {
 }
 
 // key = Bytes, key should be Address -- TODO
-type Route<T> = HashMap<Bytes, T>;
-type LocalAndConfiguredRoutes<T> = (Route<T>, Route<T>);
+type Routes<T> = HashMap<String, T>;
+type LocalAndConfiguredRoutes<T> = (Routes<T>, Routes<T>);
 
 pub trait RouteManagerStore: Clone {
     type Account: CcpRoutingAccount;
@@ -102,6 +107,7 @@ pub trait RouteManagerStore: Clone {
 
     fn get_accounts_to_send_routes_to(
         &self,
+        ignore_accounts: Vec<<Self::Account as Account>::AccountId>,
     ) -> Box<dyn Future<Item = Vec<Self::Account>, Error = ()> + Send>;
 
     fn get_accounts_to_receive_routes_from(
@@ -110,6 +116,6 @@ pub trait RouteManagerStore: Clone {
 
     fn set_routes(
         &mut self,
-        routes: impl IntoIterator<Item = (Bytes, Self::Account)>,
+        routes: impl IntoIterator<Item = (String, Self::Account)>,
     ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
 }

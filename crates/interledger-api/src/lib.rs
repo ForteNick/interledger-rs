@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use futures::Future;
-use interledger_http::{HttpAccount, HttpServer as IlpOverHttpServer, HttpStore};
+use interledger_http::{HttpAccount, HttpStore};
 use interledger_packet::Address;
 use interledger_router::RouterStore;
 use interledger_service::{Account, AddressStore, IncomingService, OutgoingService, Username};
@@ -8,21 +8,17 @@ use interledger_service_util::{BalanceStore, ExchangeRateStore};
 use interledger_settlement::{SettlementAccount, SettlementStore};
 use interledger_stream::StreamNotificationsStore;
 use serde::{de, Deserialize, Serialize};
-use std::{
-    error::Error as StdError,
-    fmt::{self, Display},
-    net::SocketAddr,
-    str::FromStr,
-};
+use std::{boxed::*, collections::HashMap, fmt::Display, net::SocketAddr, str::FromStr};
 use warp::{self, Filter};
 mod routes;
 use interledger_btp::{BtpAccount, BtpOutgoingService};
 use interledger_ccp::CcpRoutingAccount;
 use secrecy::SecretString;
+use url::Url;
 
 pub(crate) mod http_retry;
 
-// This enum and the following two functions are used to allow clients to send either
+// This enum and the following functions are used to allow clients to send either
 // numbers or strings and have them be properly deserialized into the appropriate
 // integer type.
 #[derive(Deserialize)]
@@ -58,6 +54,22 @@ where
     }
 }
 
+pub fn map_of_number_or_string<'de, D>(deserializer: D) -> Result<HashMap<String, f64>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Wrapper(#[serde(deserialize_with = "number_or_string")] f64);
+
+    let v = HashMap::<String, Wrapper>::deserialize(deserializer)?;
+    Ok(v.into_iter().map(|(k, Wrapper(v))| (k, v)).collect())
+}
+
+// TODO should the methods from this trait be split up and put into the
+// traits that are more specific to what they're doing?
+// One argument against doing that is that the NodeStore allows admin-only
+// modifications to the values, whereas many of the other traits mostly
+// read from the configured values.
 pub trait NodeStore: AddressStore + Clone + Send + Sync + 'static {
     type Account: Account;
 
@@ -95,7 +107,27 @@ pub trait NodeStore: AddressStore + Clone + Send + Sync + 'static {
         prefix: String,
         account_id: <Self::Account as Account>::AccountId,
     ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
+
+    fn set_default_route(
+        &self,
+        account_id: <Self::Account as Account>::AccountId,
+    ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
+
+    fn set_settlement_engines(
+        &self,
+        asset_to_url_map: impl IntoIterator<Item = (String, Url)>,
+    ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
+
+    fn get_asset_settlement_engine(
+        &self,
+        asset_code: &str,
+    ) -> Box<dyn Future<Item = Option<Url>, Error = ()> + Send>;
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExchangeRates(
+    #[serde(deserialize_with = "map_of_number_or_string")] HashMap<String, f64>,
+);
 
 /// AccountSettings is a subset of the user parameters defined in
 /// AccountDetails. Its purpose is to allow a user to modify certain of their
@@ -110,10 +142,12 @@ pub struct AccountSettings {
     pub ilp_over_btp_outgoing_token: Option<SecretString>,
     pub ilp_over_http_url: Option<String>,
     pub ilp_over_btp_url: Option<String>,
+    #[serde(default, deserialize_with = "optional_number_or_string")]
     pub settle_threshold: Option<i64>,
     // Note that this is intentionally an unsigned integer because users should
     // not be able to set the settle_to value to be negative (meaning the node
     // would pre-fund with the user)
+    #[serde(default, deserialize_with = "optional_number_or_string")]
     pub settle_to: Option<u64>,
 }
 
@@ -129,7 +163,9 @@ pub struct EncryptedAccountSettings {
     pub ilp_over_btp_outgoing_token: Option<Bytes>,
     pub ilp_over_http_url: Option<String>,
     pub ilp_over_btp_url: Option<String>,
+    #[serde(default, deserialize_with = "optional_number_or_string")]
     pub settle_threshold: Option<i64>,
+    #[serde(default, deserialize_with = "optional_number_or_string")]
     pub settle_to: Option<u64>,
 }
 
@@ -164,27 +200,6 @@ pub struct AccountDetails {
     pub packets_per_minute_limit: Option<u32>,
     pub settlement_engine_url: Option<String>,
 }
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum ApiError {
-    AccountNotFound,
-    BadRequest,
-    InternalServerError,
-    Unauthorized,
-}
-
-impl Display for ApiError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(match self {
-            ApiError::AccountNotFound => "Account not found",
-            ApiError::BadRequest => "Bad request",
-            ApiError::InternalServerError => "Internal server error",
-            ApiError::Unauthorized => "Unauthorized",
-        })
-    }
-}
-
-impl StdError for ApiError {}
 
 pub struct NodeApi<S, I, O, B, A: Account> {
     store: S,
@@ -247,42 +262,100 @@ where
     }
 
     pub fn into_warp_filter(self) -> warp::filters::BoxedFilter<(impl warp::Reply,)> {
-        // POST /ilp is the route for ILP-over-HTTP
-        let ilp_over_http = warp::path("ilp").and(warp::path::end()).and(
-            IlpOverHttpServer::new(self.incoming_handler.clone(), self.store.clone()).as_filter(),
-        );
-
-        ilp_over_http
-            .or(routes::accounts_api(
-                self.server_secret,
-                self.admin_api_token.clone(),
-                self.default_spsp_account,
-                self.incoming_handler,
-                self.outgoing_handler,
-                self.btp,
-                self.store.clone(),
-            ))
-            .or(routes::node_settings_api(self.admin_api_token, self.store))
-            .recover(|err: warp::Rejection| {
-                if let Some(&err) = err.find_cause::<ApiError>() {
-                    let code = match err {
-                        ApiError::AccountNotFound => warp::http::StatusCode::NOT_FOUND,
-                        ApiError::BadRequest => warp::http::StatusCode::BAD_REQUEST,
-                        ApiError::InternalServerError => {
-                            warp::http::StatusCode::INTERNAL_SERVER_ERROR
-                        }
-                        ApiError::Unauthorized => warp::http::StatusCode::UNAUTHORIZED,
-                    };
-                    Ok(warp::reply::with_status(warp::reply(), code))
-                } else {
-                    Err(err)
-                }
-            })
-            .with(warp::log("interledger-api"))
-            .boxed()
+        routes::accounts_api(
+            self.server_secret,
+            self.admin_api_token.clone(),
+            self.default_spsp_account,
+            self.incoming_handler,
+            self.outgoing_handler,
+            self.btp,
+            self.store.clone(),
+        )
+        .or(routes::node_settings_api(self.admin_api_token, self.store))
+        .boxed()
     }
 
     pub fn bind(self, addr: SocketAddr) -> impl Future<Item = (), Error = ()> {
         warp::serve(self.into_warp_filter()).bind(addr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{self, json};
+
+    #[test]
+    fn number_or_string_deserialization() {
+        #[derive(PartialEq, Deserialize, Debug)]
+        struct One {
+            #[serde(deserialize_with = "number_or_string")]
+            val: u64,
+        }
+        assert_eq!(
+            serde_json::from_str::<One>("{\"val\":1}").unwrap(),
+            One { val: 1 }
+        );
+        assert_eq!(
+            serde_json::from_str::<One>("{\"val\":\"1\"}").unwrap(),
+            One { val: 1 }
+        );
+
+        assert!(serde_json::from_str::<One>("{\"val\":\"not-a-number\"}").is_err());
+        assert!(serde_json::from_str::<One>("{\"val\":\"-1\"}").is_err());
+    }
+
+    #[test]
+    fn optional_number_or_string_deserialization() {
+        #[derive(PartialEq, Deserialize, Debug)]
+        struct One {
+            #[serde(deserialize_with = "optional_number_or_string")]
+            val: Option<u64>,
+        }
+        assert_eq!(
+            serde_json::from_str::<One>("{\"val\":1}").unwrap(),
+            One { val: Some(1) }
+        );
+        assert_eq!(
+            serde_json::from_str::<One>("{\"val\":\"1\"}").unwrap(),
+            One { val: Some(1) }
+        );
+        assert!(serde_json::from_str::<One>("{}").is_err());
+
+        #[derive(PartialEq, Deserialize, Debug)]
+        struct Two {
+            #[serde(default, deserialize_with = "optional_number_or_string")]
+            val: Option<u64>,
+        }
+        assert_eq!(
+            serde_json::from_str::<Two>("{\"val\":2}").unwrap(),
+            Two { val: Some(2) }
+        );
+        assert_eq!(
+            serde_json::from_str::<Two>("{\"val\":\"2\"}").unwrap(),
+            Two { val: Some(2) }
+        );
+        assert_eq!(
+            serde_json::from_str::<Two>("{}").unwrap(),
+            Two { val: None }
+        );
+    }
+
+    #[test]
+    fn account_settings_deserialization() {
+        let settings: AccountSettings = serde_json::from_value(json!({
+            "ilp_over_http_url": "https://example.com/ilp",
+            "ilp_over_http_incoming_token": "secret",
+            "settle_to": 0,
+            "settle_threshold": "1000",
+        }))
+        .unwrap();
+        assert_eq!(settings.settle_threshold, Some(1000));
+        assert_eq!(settings.settle_to, Some(0));
+        assert_eq!(
+            settings.ilp_over_http_url,
+            Some("https://example.com/ilp".to_string())
+        );
+        assert!(settings.ilp_over_btp_url.is_none());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "interledger-router"
-version = "0.2.2-alpha.1"
+version = "0.3.0"
 authors = ["Evan Schwartz <evan@ripple.com>"]
 description = "Router for Interledger requests"
 license = "Apache-2.0"
@@ -8,12 +8,11 @@ edition = "2018"
 repository = "https://github.com/interledger-rs/interledger-rs"
 
 [dependencies]
-bytes = "0.4.12"
-futures = "0.1.25"
-interledger-packet = { path = "../interledger-packet", version = "^0.2.2-alpha.1"}
-interledger-service = { path = "../interledger-service", version = "^0.2.2-alpha.1"}
-log = "0.4.6"
-parking_lot = "0.7.1"
+futures = { version = "0.1.29", default-features = false }
+interledger-packet = { path = "../interledger-packet", version = "^0.3.0", default-features = false }
+interledger-service = { path = "../interledger-service", version = "^0.3.0", default-features = false }
+log = { version = "0.4.8", default-features = false }
+parking_lot = { version = "0.9.0", default-features = false }
 
 [dev-dependencies]
-lazy_static = "1.4.0"
+lazy_static = { version = "1.4.0", default-features = false }

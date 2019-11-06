@@ -1,7 +1,6 @@
 use bytes::Bytes;
-use log::error;
 use ring::{
-    aead, digest, hmac,
+    aead, hmac,
     rand::{SecureRandom, SystemRandom},
 };
 
@@ -9,18 +8,18 @@ const NONCE_LENGTH: usize = 12;
 static ENCRYPTION_KEY_GENERATION_STRING: &[u8] = b"ilp_store_redis_encryption_key";
 
 use core::sync::atomic;
-use secrecy::{DebugSecret, Secret};
+use secrecy::{DebugSecret, Secret, SecretBytes};
 use std::ptr;
 use zeroize::Zeroize;
 
 #[derive(Debug)]
-pub struct EncryptionKey(pub(crate) aead::SealingKey);
+pub struct EncryptionKey(pub(crate) aead::LessSafeKey);
 
 #[derive(Debug)]
-pub struct DecryptionKey(pub(crate) aead::OpeningKey);
+pub struct DecryptionKey(pub(crate) aead::LessSafeKey);
 
 #[derive(Debug)]
-pub struct GenerationKey(pub(crate) hmac::SigningKey);
+pub struct GenerationKey(pub(crate) hmac::Key);
 
 impl DebugSecret for EncryptionKey {}
 impl DebugSecret for DecryptionKey {}
@@ -30,7 +29,9 @@ impl Zeroize for EncryptionKey {
     fn zeroize(&mut self) {
         // Instead of clearing the memory, we overwrite the key with a
         // slice filled with zeros
-        let empty_key = EncryptionKey(aead::SealingKey::new(&aead::AES_256_GCM, &[0; 32]).unwrap());
+        let empty_key = EncryptionKey(aead::LessSafeKey::new(
+            aead::UnboundKey::new(&aead::AES_256_GCM, &[0; 32]).unwrap(),
+        ));
         volatile_write(self, empty_key);
         atomic_fence();
     }
@@ -46,7 +47,9 @@ impl Zeroize for DecryptionKey {
     fn zeroize(&mut self) {
         // Instead of clearing the memory, we overwrite the key with a
         // slice filled with zeros
-        let empty_key = DecryptionKey(aead::OpeningKey::new(&aead::AES_256_GCM, &[0; 32]).unwrap());
+        let empty_key = DecryptionKey(aead::LessSafeKey::new(
+            aead::UnboundKey::new(&aead::AES_256_GCM, &[0; 32]).unwrap(),
+        ));
         volatile_write(self, empty_key);
         atomic_fence();
     }
@@ -62,7 +65,7 @@ impl Zeroize for GenerationKey {
     fn zeroize(&mut self) {
         // Instead of clearing the memory, we overwrite the key with a
         // slice filled with zeros
-        let empty_key = GenerationKey(hmac::SigningKey::new(&digest::SHA256, &[0; 32]));
+        let empty_key = GenerationKey(hmac::Key::new(hmac::HMAC_SHA256, &[0; 32]));
         volatile_write(self, empty_key);
         atomic_fence();
     }
@@ -95,28 +98,27 @@ fn atomic_fence() {
 }
 
 pub fn generate_keys(server_secret: &[u8]) -> (Secret<EncryptionKey>, Secret<DecryptionKey>) {
-    let generation_key = GenerationKey(hmac::SigningKey::new(&digest::SHA256, server_secret));
-    let encryption_key = Secret::new(EncryptionKey(
-        aead::SealingKey::new(
+    let generation_key = GenerationKey(hmac::Key::new(hmac::HMAC_SHA256, server_secret));
+    let encryption_key = Secret::new(EncryptionKey(aead::LessSafeKey::new(
+        aead::UnboundKey::new(
             &aead::AES_256_GCM,
             hmac::sign(&generation_key.0, ENCRYPTION_KEY_GENERATION_STRING).as_ref(),
         )
         .unwrap(),
-    ));
-    let decryption_key = Secret::new(DecryptionKey(
-        aead::OpeningKey::new(
+    )));
+    let decryption_key = Secret::new(DecryptionKey(aead::LessSafeKey::new(
+        aead::UnboundKey::new(
             &aead::AES_256_GCM,
             hmac::sign(&generation_key.0, ENCRYPTION_KEY_GENERATION_STRING).as_ref(),
         )
         .unwrap(),
-    ));
+    )));
     // the generation key is dropped and zeroized here
     (encryption_key, decryption_key)
 }
 
-pub fn encrypt_token(encryption_key: &aead::SealingKey, token: &[u8]) -> Bytes {
+pub fn encrypt_token(encryption_key: &aead::LessSafeKey, token: &[u8]) -> Bytes {
     let mut token = token.to_vec();
-    token.extend_from_slice(&[0u8; 16]);
 
     let mut nonce: [u8; NONCE_LENGTH] = [0; NONCE_LENGTH];
     SystemRandom::new()
@@ -124,25 +126,21 @@ pub fn encrypt_token(encryption_key: &aead::SealingKey, token: &[u8]) -> Bytes {
         .expect("Unable to get sufficient entropy for nonce");
     let nonce_copy = nonce;
     let nonce = aead::Nonce::assume_unique_for_key(nonce);
-    if let Ok(out_len) = aead::seal_in_place(
-        &encryption_key,
-        nonce,
-        aead::Aad::from(&[]),
-        &mut token,
-        encryption_key.algorithm().tag_len(),
-    ) {
-        token.split_off(out_len);
-        token.append(&mut nonce_copy.as_ref().to_vec());
-        Bytes::from(token)
-    } else {
-        panic!("Unable to encrypt token");
+    match encryption_key.seal_in_place_append_tag(nonce, aead::Aad::from(&[]), &mut token) {
+        Ok(_) => {
+            token.append(&mut nonce_copy.as_ref().to_vec());
+            Bytes::from(token)
+        }
+        _ => panic!("Unable to encrypt token"),
     }
 }
 
-pub fn decrypt_token(decryption_key: &aead::OpeningKey, encrypted: &[u8]) -> Option<Bytes> {
+pub fn decrypt_token(
+    decryption_key: &aead::LessSafeKey,
+    encrypted: &[u8],
+) -> Result<SecretBytes, ()> {
     if encrypted.len() < aead::MAX_TAG_LEN {
-        error!("Cannot decrypt token, encrypted value does not have a nonce attached");
-        return None;
+        return Err(());
     }
 
     let mut encrypted = encrypted.to_vec();
@@ -151,13 +149,10 @@ pub fn decrypt_token(decryption_key: &aead::OpeningKey, encrypted: &[u8]) -> Opt
     nonce.copy_from_slice(nonce_bytes.as_ref());
     let nonce = aead::Nonce::assume_unique_for_key(nonce);
 
-    if let Ok(token) =
-        aead::open_in_place(decryption_key, nonce, aead::Aad::empty(), 0, &mut encrypted)
-    {
-        Some(Bytes::from(token.to_vec()))
+    if let Ok(token) = decryption_key.open_in_place(nonce, aead::Aad::empty(), &mut encrypted) {
+        Ok(SecretBytes::new(token.to_vec()))
     } else {
-        error!("Unable to decrypt token");
-        None
+        Err(())
     }
 }
 
@@ -173,7 +168,7 @@ mod encryption {
         let encrypted = encrypt_token(&encryption_key.expose_secret().0, b"test test");
         let decrypted = decrypt_token(&decryption_key.expose_secret().0, encrypted.as_ref());
         assert_eq!(
-            str::from_utf8(decrypted.unwrap().as_ref()).unwrap(),
+            str::from_utf8(decrypted.unwrap().expose_secret().as_ref()).unwrap(),
             "test test"
         );
     }

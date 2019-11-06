@@ -30,16 +30,21 @@ use futures::{Future, IntoFuture};
 use interledger_packet::{Address, Fulfill, Prepare, Reject};
 use std::{
     cmp::Eq,
-    fmt::{Debug, Display},
+    fmt::{self, Debug, Display},
     hash::Hash,
     marker::PhantomData,
     str::FromStr,
+    sync::Arc,
 };
 
 use serde::Serialize;
 
 mod auth;
 pub use auth::{Auth as AuthToken, Username};
+#[cfg(feature = "trace")]
+mod trace;
+#[cfg(feature = "trace")]
+pub use trace::*;
 
 /// The base trait that Account types from other Services extend.
 /// This trait only assumes that the account has an ID that can be compared with others.
@@ -58,19 +63,49 @@ pub trait Account: Clone + Send + Sized + Debug {
 }
 
 /// A struct representing an incoming ILP Prepare packet or an outgoing one before the next hop is set.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IncomingRequest<A: Account> {
     pub from: A,
     pub prepare: Prepare,
 }
 
+// Use a custom debug implementation to specify the order of the fields
+impl<A> Debug for IncomingRequest<A>
+where
+    A: Account,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter
+            .debug_struct("IncomingRequest")
+            .field("prepare", &self.prepare)
+            .field("from", &self.from)
+            .finish()
+    }
+}
+
 /// A struct representing an ILP Prepare packet with the incoming and outgoing accounts set.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OutgoingRequest<A: Account> {
     pub from: A,
     pub to: A,
     pub original_amount: u64,
     pub prepare: Prepare,
+}
+
+// Use a custom debug implementation to specify the order of the fields
+impl<A> Debug for OutgoingRequest<A>
+where
+    A: Account,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter
+            .debug_struct("OutgoingRequest")
+            .field("prepare", &self.prepare)
+            .field("original_amount", &self.original_amount)
+            .field("to", &self.to)
+            .field("from", &self.from)
+            .finish()
+    }
 }
 
 /// Set the `to` Account and turn this into an OutgoingRequest
@@ -93,6 +128,19 @@ pub trait IncomingService<A: Account> {
     type Future: Future<Item = Fulfill, Error = Reject> + Send + 'static;
 
     fn handle_request(&mut self, request: IncomingRequest<A>) -> Self::Future;
+
+    /// Wrap the given service such that the provided function will
+    /// be called to handle each request. That function can
+    /// return immediately, modify the request before passing it on,
+    /// and/or handle the result of calling the inner service.
+    fn wrap<F, R>(self, f: F) -> WrappedService<F, Self, A>
+    where
+        F: Fn(IncomingRequest<A>, Self) -> R,
+        R: Future<Item = Fulfill, Error = Reject> + Send + 'static,
+        Self: Clone + Sized,
+    {
+        WrappedService::wrap_incoming(self, f)
+    }
 }
 
 /// Core service trait for sending OutgoingRequests that asynchronously returns an ILP Fulfill or Reject packet.
@@ -100,6 +148,19 @@ pub trait OutgoingService<A: Account> {
     type Future: Future<Item = Fulfill, Error = Reject> + Send + 'static;
 
     fn send_request(&mut self, request: OutgoingRequest<A>) -> Self::Future;
+
+    /// Wrap the given service such that the provided function will
+    /// be called to handle each request. That function can
+    /// return immediately, modify the request before passing it on,
+    /// and/or handle the result of calling the inner service.
+    fn wrap<F, R>(self, f: F) -> WrappedService<F, Self, A>
+    where
+        F: Fn(OutgoingRequest<A>, Self) -> R,
+        R: Future<Item = Fulfill, Error = Reject> + Send + 'static,
+        Self: Clone + Sized,
+    {
+        WrappedService::wrap_outgoing(self, f)
+    }
 }
 
 /// A future that returns an ILP Fulfill or Reject packet.
@@ -181,6 +242,87 @@ where
 
     fn send_request(&mut self, request: OutgoingRequest<A>) -> Self::Future {
         Box::new((self.handler)(request).into_future())
+    }
+}
+
+/// A service that wraps another one with a function that will be called
+/// on every request.
+///
+/// This enables wrapping services without the boilerplate of defining a
+/// new struct and implementing IncomingService and/or OutgoingService
+/// every time.
+#[derive(Clone)]
+pub struct WrappedService<F, I, A> {
+    f: F,
+    inner: Arc<I>,
+    account_type: PhantomData<A>,
+}
+
+impl<F, IO, A, R> WrappedService<F, IO, A>
+where
+    F: Fn(IncomingRequest<A>, IO) -> R,
+    IO: IncomingService<A> + Clone,
+    A: Account,
+    R: Future<Item = Fulfill, Error = Reject> + Send + 'static,
+{
+    /// Wrap the given service such that the provided function will
+    /// be called to handle each request. That function can
+    /// return immediately, modify the request before passing it on,
+    /// and/or handle the result of calling the inner service.
+    pub fn wrap_incoming(inner: IO, f: F) -> Self {
+        WrappedService {
+            f,
+            inner: Arc::new(inner),
+            account_type: PhantomData,
+        }
+    }
+}
+
+impl<F, IO, A, R> IncomingService<A> for WrappedService<F, IO, A>
+where
+    F: Fn(IncomingRequest<A>, IO) -> R,
+    IO: IncomingService<A> + Clone,
+    A: Account,
+    R: Future<Item = Fulfill, Error = Reject> + Send + 'static,
+{
+    type Future = R;
+
+    fn handle_request(&mut self, request: IncomingRequest<A>) -> R {
+        (self.f)(request, (*self.inner).clone())
+    }
+}
+
+impl<F, IO, A, R> WrappedService<F, IO, A>
+where
+    F: Fn(OutgoingRequest<A>, IO) -> R,
+    IO: OutgoingService<A> + Clone,
+    A: Account,
+    R: Future<Item = Fulfill, Error = Reject> + Send + 'static,
+{
+    /// Wrap the given service such that the provided function will
+    /// be called to handle each request. That function can
+    /// return immediately, modify the request before passing it on,
+    /// and/or handle the result of calling the inner service.
+    pub fn wrap_outgoing(inner: IO, f: F) -> Self {
+        WrappedService {
+            f,
+            inner: Arc::new(inner),
+            account_type: PhantomData,
+        }
+    }
+}
+
+impl<F, IO, A, R> OutgoingService<A> for WrappedService<F, IO, A>
+where
+    F: Fn(OutgoingRequest<A>, IO) -> R,
+    IO: OutgoingService<A> + Clone,
+    A: Account,
+    R: Future<Item = Fulfill, Error = Reject> + Send + 'static,
+{
+    type Future = R;
+
+    fn send_request(&mut self, request: OutgoingRequest<A>) -> R {
+        (self.f)(request, (*self.inner).clone())
     }
 }
 

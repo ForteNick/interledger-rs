@@ -17,6 +17,7 @@
 
 use super::account::*;
 use super::crypto::{encrypt_token, generate_keys, DecryptionKey, EncryptionKey};
+use super::reconnect::RedisReconnect;
 use bytes::Bytes;
 use futures::{
     future::{err, ok, result, Either},
@@ -31,22 +32,29 @@ use http::StatusCode;
 use interledger_api::{AccountDetails, AccountSettings, EncryptedAccountSettings, NodeStore};
 use interledger_btp::BtpStore;
 use interledger_ccp::{CcpRoutingAccount, RouteManagerStore, RoutingRelation};
-use interledger_http::HttpStore;
+use interledger_http::{
+    idempotency::{IdempotentData, IdempotentStore},
+    HttpStore,
+};
 use interledger_packet::Address;
 use interledger_router::RouterStore;
 use interledger_service::{Account as AccountTrait, AccountStore, AddressStore, Username};
 use interledger_service_util::{BalanceStore, ExchangeRateStore, RateLimitError, RateLimitStore};
-use interledger_settlement::{IdempotentData, IdempotentStore, SettlementStore};
+use interledger_settlement::{
+    scale_with_precision_loss, Convert, ConvertDetails, LeftoversStore, SettlementStore,
+};
 use interledger_stream::{PaymentNotification, StreamNotificationsStore};
 use lazy_static::lazy_static;
+use num_bigint::BigUint;
 use parking_lot::RwLock;
 use redis::{
-    self, aio::SharedConnection, cmd, Client, ConnectionInfo, ControlFlow, PipelineCommands,
-    PubSubCommands, Script, Value,
+    self, cmd, Client, ConnectionInfo, ControlFlow, ErrorKind, FromRedisValue, PipelineCommands,
+    PubSubCommands, RedisError, RedisWrite, Script, ToRedisArgs, Value,
 };
+use secrecy::{ExposeSecret, Secret};
 use serde_json;
 use std::{
-    iter::FromIterator,
+    iter::{self, FromIterator},
     str,
     str::FromStr,
     sync::Arc,
@@ -54,12 +62,29 @@ use std::{
 };
 use tokio_executor::spawn;
 use tokio_timer::Interval;
-
-use secrecy::{ExposeSecret, Secret};
+use url::Url;
 use zeroize::Zeroize;
 
 const DEFAULT_POLL_INTERVAL: u64 = 30000; // 30 seconds
+
 static PARENT_ILP_KEY: &str = "parent_node_account_address";
+static ROUTES_KEY: &str = "routes:current";
+static STATIC_ROUTES_KEY: &str = "routes:static";
+static DEFAULT_ROUTE_KEY: &str = "routes:default";
+static STREAM_NOTIFICATIONS_PREFIX: &str = "stream_notifications:";
+static SETTLEMENT_ENGINES_KEY: &str = "settlement_engines";
+
+fn uncredited_amount_key(account_id: impl ToString) -> String {
+    format!("uncredited-amount:{}", account_id.to_string())
+}
+
+fn prefixed_idempotency_key(idempotency_key: String) -> String {
+    format!("idempotency-key:{}", idempotency_key)
+}
+
+fn accounts_key(account_id: AccountId) -> String {
+    format!("accounts:{}", account_id)
+}
 
 // The following are Lua scripts that are used to atomically execute the given logic
 // inside Redis. This allows for more complex logic without needing multiple round
@@ -69,122 +94,25 @@ static PARENT_ILP_KEY: &str = "parent_node_account_address";
 lazy_static! {
     static ref DEFAULT_ILP_ADDRESS: Address = Address::from_str("local.host").unwrap();
 
-    // This lua script fetches an account associated with a username. The client
-    // MUST ensure that the returned account is authenticated.
-    static ref ACCOUNT_FROM_USERNAME: Script = Script::new("
-    local acc_id = redis.call('HGET', 'usernames', ARGV[1])
-    local id_key = 'accounts:' .. acc_id
-    return redis.call('HGETALL', id_key)");
+    /// This lua script fetches an account associated with a username. The client
+    /// MUST ensure that the returned account is authenticated.
+    static ref ACCOUNT_FROM_USERNAME: Script = Script::new(include_str!("lua/account_from_username.lua"));
 
-    static ref PROCESS_PREPARE: Script = Script::new("
-    local from_id = ARGV[1]
-    local from_account = 'accounts:' .. ARGV[1]
-    local from_amount = tonumber(ARGV[2])
-    local min_balance, balance, prepaid_amount = unpack(redis.call('HMGET', from_account, 'min_balance', 'balance', 'prepaid_amount'))
-    balance = tonumber(balance)
-    prepaid_amount = tonumber(prepaid_amount)
+    /// Load a list of accounts
+    /// If an account does not have a settlement_engine_url set
+    /// but there is one configured for that account's currency,
+    /// it will use the globally configured url
+    static ref LOAD_ACCOUNTS: Script = Script::new(include_str!("lua/load_accounts.lua"));
 
-    -- Check that the prepare wouldn't go under the account's minimum balance
-    if min_balance then
-        min_balance = tonumber(min_balance)
-        if balance + prepaid_amount - from_amount < min_balance then
-            error('Incoming prepare of ' .. from_amount .. ' would bring account ' .. from_id .. ' under its minimum balance. Current balance: ' .. balance .. ', min balance: ' .. min_balance)
-        end
-    end
+    static ref PROCESS_PREPARE: Script = Script::new(include_str!("lua/process_prepare.lua"));
 
-    -- Deduct the from_amount from the prepaid_amount and/or the balance
-    if prepaid_amount >= from_amount then
-        prepaid_amount = redis.call('HINCRBY', from_account, 'prepaid_amount', 0 - from_amount)
-    elseif prepaid_amount > 0 then
-        local sub_from_balance = from_amount - prepaid_amount
-        prepaid_amount = 0
-        redis.call('HSET', from_account, 'prepaid_amount', 0)
-        balance = redis.call('HINCRBY', from_account, 'balance', 0 - sub_from_balance)
-    else
-        balance = redis.call('HINCRBY', from_account, 'balance', 0 - from_amount)
-    end
+    static ref PROCESS_FULFILL: Script = Script::new(include_str!("lua/process_fulfill.lua"));
 
-    return balance + prepaid_amount");
+    static ref PROCESS_REJECT: Script = Script::new(include_str!("lua/process_reject.lua"));
 
-    static ref PROCESS_FULFILL: Script = Script::new("
-    local to_account = 'accounts:' .. ARGV[1]
-    local to_amount = tonumber(ARGV[2])
+    static ref REFUND_SETTLEMENT: Script = Script::new(include_str!("lua/refund_settlement.lua"));
 
-    local balance = redis.call('HINCRBY', to_account, 'balance', to_amount)
-    local prepaid_amount, settle_threshold, settle_to = unpack(redis.call('HMGET', to_account, 'prepaid_amount', 'settle_threshold', 'settle_to'))
-
-    -- The logic for trigerring settlement is as follows:
-    --  1. settle_threshold must be non-nil (if it's nil, then settlement was perhaps disabled on the account).
-    --  2. balance must be greater than settle_threshold (this is the core of the 'should I settle logic')
-    --  3. settle_threshold must be greater than settle_to (e.g., settleTo=5, settleThreshold=6)
-    local settle_amount = 0
-    if (settle_threshold and settle_to) and (balance >= tonumber(settle_threshold)) and (tonumber(settle_threshold) > tonumber(settle_to)) then
-        settle_amount = balance - tonumber(settle_to)
-
-        -- Update the balance _before_ sending the settlement so that we don't accidentally send
-        -- multiple settlements for the same balance. If the settlement fails we'll roll back
-        -- the balance change by re-adding the amount back to the balance
-        balance = settle_to
-        redis.call('HSET', to_account, 'balance', balance)
-    end
-
-    return {balance + prepaid_amount, settle_amount}");
-
-    static ref PROCESS_REJECT: Script = Script::new("
-    local from_account = 'accounts:' .. ARGV[1]
-    local from_amount = tonumber(ARGV[2])
-
-    local prepaid_amount = redis.call('HGET', from_account, 'prepaid_amount')
-    local balance = redis.call('HINCRBY', from_account, 'balance', from_amount)
-    return balance + prepaid_amount");
-
-    static ref REFUND_SETTLEMENT: Script = Script::new("
-    local account = 'accounts:' .. ARGV[1]
-    local settle_amount = tonumber(ARGV[2])
-
-    local balance = redis.call('HINCRBY', account, 'balance', settle_amount)
-    return balance");
-
-    static ref PROCESS_INCOMING_SETTLEMENT: Script = Script::new("
-    local account = 'accounts:' .. ARGV[1]
-    local amount = tonumber(ARGV[2])
-    local idempotency_key = ARGV[3]
-
-    local balance, prepaid_amount = unpack(redis.call('HMGET', account, 'balance', 'prepaid_amount'))
-
-    -- If idempotency key has been used, then do not perform any operations
-    if redis.call('EXISTS', idempotency_key) == 1 then
-        return balance + prepaid_amount
-    end
-
-    -- Otherwise, set it to true and make it expire after 24h (86400 sec)
-    redis.call('SET', idempotency_key, 'true', 'EX', 86400)
-
-    -- Credit the incoming settlement to the balance and/or prepaid amount,
-    -- depending on whether that account currently owes money or not
-    if tonumber(balance) >= 0 then
-        prepaid_amount = redis.call('HINCRBY', account, 'prepaid_amount', amount)
-    elseif math.abs(balance) >= amount then
-        balance = redis.call('HINCRBY', account, 'balance', amount)
-    else
-        prepaid_amount = redis.call('HINCRBY', account, 'prepaid_amount', amount + balance)
-        balance = 0
-        redis.call('HSET', account, 'balance', 0)
-    end
-
-    return balance + prepaid_amount");
-}
-
-static ROUTES_KEY: &str = "routes:current";
-static STATIC_ROUTES_KEY: &str = "routes:static";
-static STREAM_NOTIFICATIONS_PREFIX: &str = "stream_notifications:";
-
-fn prefixed_idempotency_key(idempotency_key: String) -> String {
-    format!("idempotency-key:{}", idempotency_key)
-}
-
-fn accounts_key(account_id: AccountId) -> String {
-    format!("accounts:{}", account_id)
+    static ref PROCESS_INCOMING_SETTLEMENT: Script = Script::new(include_str!("lua/process_incoming_settlement.lua"));
 }
 
 pub struct RedisStoreBuilder {
@@ -221,14 +149,8 @@ impl RedisStoreBuilder {
         let poll_interval = self.poll_interval;
         let ilp_address = self.node_ilp_address.clone();
 
-        result(Client::open(redis_info.clone()))
-            .map_err(|err| error!("Error creating shared Redis client: {:?}", err))
-            .and_then(|client| {
-                debug!("Connected shared client to redis: {:?}", client);
-                client
-                    .get_shared_async_connection()
-                    .map_err(|err| error!("Error connecting shared client to Redis: {:?}", err))
-            })
+        RedisReconnect::connect(redis_info.clone())
+            .map_err(|_| ())
             .join(
                 result(Client::open(redis_info.clone()))
                     .map_err(|err| error!("Error creating subscription Redis client: {:?}", err))
@@ -239,21 +161,21 @@ impl RedisStoreBuilder {
                         })
                     }),
             )
-            .and_then(move |(shared_connection, mut sub_connection)| {
+            .and_then(move |(connection, mut sub_connection)| {
                 // Before initializing the store, check if we have an address
                 // that was configured due to adding a parent. If no parent was
                 // found, use the builder's provided address (local.host) or the
                 // one we decided to override it with
                 redis::cmd("GET")
                     .arg(PARENT_ILP_KEY)
-                    .query_async(shared_connection.clone())
+                    .query_async(connection.clone())
                     .map_err(|err| {
                         error!(
                             "Error checking whether we have a parent configured: {:?}",
                             err
                         )
                     })
-                    .and_then(move |(_, address): (SharedConnection, Option<String>)| {
+                    .and_then(move |(_, address): (RedisReconnect, Option<String>)| {
                         Ok(if let Some(address) = address {
                             Address::from_str(&address).unwrap()
                         } else {
@@ -263,25 +185,29 @@ impl RedisStoreBuilder {
                     .and_then(move |node_ilp_address| {
                         let store = RedisStore {
                             ilp_address: Arc::new(RwLock::new(node_ilp_address)),
-                            connection: Arc::new(shared_connection),
+                            connection,
                             subscriptions: Arc::new(RwLock::new(HashMap::new())),
                             exchange_rates: Arc::new(RwLock::new(HashMap::new())),
-                            routes: Arc::new(RwLock::new(HashMap::new())),
+                            routes: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
                             encryption_key: Arc::new(encryption_key),
                             decryption_key: Arc::new(decryption_key),
                         };
 
                         // Poll for routing table updates
                         // Note: if this behavior changes, make sure to update the Drop implementation
-                        let connection_clone = Arc::downgrade(&store.connection);
+                        let connection_clone = Arc::downgrade(&store.connection.conn);
+                        let redis_info = store.connection.redis_info.clone();
                         let routing_table = store.routes.clone();
                         let poll_routes =
                             Interval::new(Instant::now(), Duration::from_millis(poll_interval))
                                 .map_err(|err| error!("Interval error: {:?}", err))
                                 .for_each(move |_| {
-                                    if let Some(connection) = connection_clone.upgrade() {
+                                    if let Some(conn) = connection_clone.upgrade() {
                                         Either::A(update_routes(
-                                            connection.as_ref().clone(),
+                                            RedisReconnect {
+                                                conn,
+                                                redis_info: redis_info.clone(),
+                                            },
                                             routing_table.clone(),
                                         ))
                                     } else {
@@ -310,7 +236,7 @@ impl RedisStoreBuilder {
                                                     return ControlFlow::Continue;
                                                 }
                                             };
-                                            debug!("Subscribed message received for {:?}", account_id);
+                                            trace!("Subscribed message received for account {}: {:?}", account_id, message);
                                             match subscriptions_clone.read().get(&account_id) {
                                                 Some(sender) => {
                                                     if let Err(err) = sender.unbounded_send(message) {
@@ -329,7 +255,7 @@ impl RedisStoreBuilder {
                                 });
                             match sub_status {
                                 Err(e) => warn!("Could not issue psubscribe to Redis: {}", e),
-                                Ok(_) => debug!("Successfully issued psubscribe to Redis"),
+                                Ok(_) => debug!("Successfully subscribed to Redis pubsub"),
                             }
                         });
 
@@ -348,10 +274,16 @@ impl RedisStoreBuilder {
 #[derive(Clone)]
 pub struct RedisStore {
     pub ilp_address: Arc<RwLock<Address>>,
-    connection: Arc<SharedConnection>,
+    connection: RedisReconnect,
     subscriptions: Arc<RwLock<HashMap<AccountId, UnboundedSender<PaymentNotification>>>>,
     exchange_rates: Arc<RwLock<HashMap<String, f64>>>,
-    routes: Arc<RwLock<HashMap<Bytes, AccountId>>>,
+    /// The store keeps the routing table in memory so that it can be returned
+    /// synchronously while the Router is processing packets.
+    /// The outer `Arc<RwLock>` is used so that we can update the stored routing
+    /// table after polling the store for updates.
+    /// The inner `Arc<HashMap>` is used so that the `routing_table` method can
+    /// return a reference to the routing table without cloning the underlying data.
+    routes: Arc<RwLock<Arc<HashMap<String, AccountId>>>>,
     encryption_key: Arc<Secret<EncryptionKey>>,
     decryption_key: Arc<Secret<DecryptionKey>>,
 }
@@ -360,7 +292,7 @@ impl RedisStore {
     pub fn get_all_accounts_ids(&self) -> impl Future<Item = Vec<AccountId>, Error = ()> {
         let mut pipe = redis::pipe();
         pipe.smembers("accounts");
-        pipe.query_async(self.connection.as_ref().clone())
+        pipe.query_async(self.connection.clone())
             .map_err(|err| error!("Error getting account IDs: {:?}", err))
             .and_then(|(_conn, account_ids): (_, Vec<Vec<AccountId>>)| Ok(account_ids[0].clone()))
     }
@@ -381,12 +313,12 @@ impl RedisStore {
             pipe.exists(PARENT_ILP_KEY);
         }
 
-        Box::new(pipe.query_async(connection.as_ref().clone())
+        Box::new(pipe.query_async(connection.clone())
             .map_err(|err| {
                 error!("Error checking whether account details already exist: {:?}", err)
             })
             .and_then(
-                move |(connection, results): (SharedConnection, Vec<bool>)| {
+                move |(connection, results): (RedisReconnect, Vec<bool>)| {
                     if results.iter().any(|val| *val) {
                         warn!("An account already exists with the same {}. Cannot insert account: {:?}", account.id, account);
                         Err(())
@@ -432,7 +364,7 @@ impl RedisStore {
                 // had to check for the existence of a parent
                 pipe.query_async(connection)
                     .map_err(|err| error!("Error inserting account into DB: {:?}", err))
-                    .and_then(move |(connection, _ret): (SharedConnection, Value)| {
+                    .and_then(move |(connection, _ret): (RedisReconnect, Value)| {
                         update_routes(connection, routing_table)
                     })
                     .and_then(move |_| {
@@ -458,9 +390,9 @@ impl RedisStore {
                 // TODO: Do not allow this update to happen if
                 // AccountDetails.RoutingRelation == Parent and parent is
                 // already set
-                .query_async(connection.as_ref().clone())
+                .query_async(connection.clone())
                 .map_err(|err| error!("Error checking whether ID exists: {:?}", err))
-                .and_then(move |(connection, exists): (SharedConnection, bool)| {
+                .and_then(move |(connection, exists): (RedisReconnect, bool)| {
                     if !exists {
                         warn!(
                             "No account exists with ID {}, cannot update account {:?}",
@@ -503,13 +435,13 @@ impl RedisStore {
                     Either::B(
                         pipe.query_async(connection)
                             .map_err(|err| error!("Error inserting account into DB: {:?}", err))
-                            .and_then(move |(connection, _ret): (SharedConnection, Value)| {
+                            .and_then(move |(connection, _ret): (RedisReconnect, Value)| {
                                 update_routes(connection, routing_table)
                             })
                             .and_then(move |_| {
                                 debug!(
-                                    "Inserted account {} (ILP address: {})",
-                                    account.id, account.ilp_address
+                                    "Inserted account {} (id: {}, ILP address: {})",
+                                    account.username, account.id, account.ilp_address
                                 );
                                 Ok(encrypted)
                             }),
@@ -578,9 +510,9 @@ impl RedisStore {
         }
 
         Box::new(
-            pipe.query_async(connection.as_ref().clone())
+            pipe.query_async(connection.clone())
                 .map_err(|err| error!("Error modifying user account: {:?}", err))
-                .and_then(move |(_connection, _ret): (SharedConnection, Value)| {
+                .and_then(move |(_connection, _ret): (RedisReconnect, Value)| {
                     // return the updated account
                     self_clone.redis_get_account(id)
                 }),
@@ -592,8 +524,13 @@ impl RedisStore {
         id: AccountId,
     ) -> Box<dyn Future<Item = AccountWithEncryptedTokens, Error = ()> + Send> {
         Box::new(
-            self.redis_get_accounts(vec![id])
-                .and_then(|accounts| accounts.get(0).cloned().ok_or(())),
+            LOAD_ACCOUNTS
+                .arg(id.to_string())
+                .invoke_async(self.connection.clone())
+                .map_err(|err| error!("Error loading accounts: {:?}", err))
+                .and_then(|(_, mut accounts): (_, Vec<AccountWithEncryptedTokens>)| {
+                    accounts.pop().ok_or(())
+                }),
         )
     }
 
@@ -601,7 +538,7 @@ impl RedisStore {
         &self,
         id: AccountId,
     ) -> Box<dyn Future<Item = AccountWithEncryptedTokens, Error = ()> + Send> {
-        let connection = self.connection.as_ref().clone();
+        let connection = self.connection.clone();
         let routing_table = self.routes.clone();
         Box::new(self.redis_get_account(id).and_then(move |encrypted| {
             let account = encrypted.account.clone();
@@ -630,7 +567,7 @@ impl RedisStore {
 
             pipe.query_async(connection)
                 .map_err(|err| error!("Error deleting account from DB: {:?}", err))
-                .and_then(move |(connection, _ret): (SharedConnection, Value)| {
+                .and_then(move |(connection, _ret): (RedisReconnect, Value)| {
                     update_routes(connection, routing_table)
                 })
                 .and_then(move |_| {
@@ -638,28 +575,6 @@ impl RedisStore {
                     Ok(encrypted)
                 })
         }))
-    }
-
-    fn redis_get_accounts(
-        &self,
-        account_ids: Vec<AccountId>,
-    ) -> Box<dyn Future<Item = Vec<AccountWithEncryptedTokens>, Error = ()> + Send> {
-        let mut pipe = redis::pipe();
-        for account_id in account_ids.iter() {
-            pipe.hgetall(accounts_key(*account_id));
-        }
-        Box::new(
-            pipe.query_async(self.connection.as_ref().clone())
-                .map_err(move |err| {
-                    error!(
-                        "Error querying details for accounts: {:?} {:?}",
-                        account_ids, err
-                    )
-                })
-                .and_then(
-                    move |(_conn, accounts): (_, Vec<AccountWithEncryptedTokens>)| Ok(accounts),
-                ),
-        )
     }
 }
 
@@ -673,9 +588,15 @@ impl AccountStore for RedisStore {
     ) -> Box<dyn Future<Item = Vec<Account>, Error = ()> + Send> {
         let decryption_key = self.decryption_key.clone();
         let num_accounts = account_ids.len();
+        let mut script = LOAD_ACCOUNTS.prepare_invoke();
+        for id in account_ids.iter() {
+            script.arg(id.to_string());
+        }
         Box::new(
-            self.redis_get_accounts(account_ids)
-                .and_then(move |accounts| {
+            script
+                .invoke_async(self.connection.clone())
+                .map_err(|err| error!("Error loading accounts: {:?}", err))
+                .and_then(move |(_, accounts): (_, Vec<AccountWithEncryptedTokens>)| {
                     if accounts.len() == num_accounts {
                         let accounts = accounts
                             .into_iter()
@@ -700,7 +621,7 @@ impl AccountStore for RedisStore {
             cmd("HGET")
                 .arg("usernames")
                 .arg(username.as_ref())
-                .query_async(self.connection.as_ref().clone())
+                .query_async(self.connection.clone())
                 .map_err(move |err| error!("Error getting account id: {:?}", err))
                 .and_then(|(_connection, id): (_, Option<AccountId>)| {
                     id.ok_or_else(move || debug!("Username not found: {}", username))
@@ -724,7 +645,7 @@ impl StreamNotificationsStore for RedisStore {
     fn publish_payment_notification(&self, payment: PaymentNotification) {
         let username = payment.to_username.clone();
         let message = serde_json::to_string(&payment).unwrap();
-        let connection = self.connection.as_ref().clone();
+        let connection = self.connection.clone();
         spawn(
             self.get_account_id_from_username(&username)
                 .map_err(move |_| {
@@ -734,16 +655,16 @@ impl StreamNotificationsStore for RedisStore {
                     )
                 })
                 .and_then(move |account_id| {
-                    debug!("Publishing message {} for ID {}", message, account_id);
+                    debug!(
+                        "Publishing payment notification {} for account {}",
+                        message, account_id
+                    );
                     redis::cmd("PUBLISH")
                         .arg(format!("{}{}", STREAM_NOTIFICATIONS_PREFIX, account_id))
                         .arg(message)
                         .query_async(connection)
                         .map_err(move |err| error!("Error publish message to Redis: {:?}", err))
-                        .and_then(move |(_, _): (_, i32)| {
-                            debug!("Successfully published message");
-                            Ok(())
-                        })
+                        .and_then(move |(_, _): (_, i32)| Ok(()))
                 }),
         );
     }
@@ -757,7 +678,7 @@ impl BalanceStore for RedisStore {
             cmd("HMGET")
                 .arg(accounts_key(account.id))
                 .arg(&["balance", "prepaid_amount"])
-                .query_async(self.connection.as_ref().clone())
+                .query_async(self.connection.clone())
                 .map_err(move |err| {
                     error!(
                         "Error getting balance for account: {} {:?}",
@@ -783,7 +704,7 @@ impl BalanceStore for RedisStore {
                 PROCESS_PREPARE
                     .arg(from_account_id)
                     .arg(incoming_amount)
-                    .invoke_async(self.connection.as_ref().clone())
+                    .invoke_async(self.connection.clone())
                     .map_err(move |err| {
                         warn!(
                             "Error handling prepare from account: {}:  {:?}",
@@ -809,16 +730,12 @@ impl BalanceStore for RedisStore {
         outgoing_amount: u64,
     ) -> Box<dyn Future<Item = (i64, u64), Error = ()> + Send> {
         if outgoing_amount > 0 {
-            debug!(
-                "To: {}, Amount paid: {}",
-                to_account.ilp_address, outgoing_amount
-            );
             let to_account_id = to_account.id;
             Box::new(
                 PROCESS_FULFILL
                     .arg(to_account_id)
                     .arg(outgoing_amount)
-                    .invoke_async(self.connection.as_ref().clone())
+                    .invoke_async(self.connection.clone())
                     .map_err(move |err| {
                         error!(
                             "Error handling Fulfill received from account: {}: {:?}",
@@ -851,7 +768,7 @@ impl BalanceStore for RedisStore {
                 PROCESS_REJECT
                     .arg(from_account_id)
                     .arg(incoming_amount)
-                    .invoke_async(self.connection.as_ref().clone())
+                    .invoke_async(self.connection.clone())
                     .map_err(move |err| {
                         warn!(
                             "Error handling reject for packet from account: {}: {:?}",
@@ -916,7 +833,7 @@ impl BtpStore for RedisStore {
         Box::new(
             ACCOUNT_FROM_USERNAME
                 .arg(username.as_ref())
-                .invoke_async(self.connection.as_ref().clone())
+                .invoke_async(self.connection.clone())
                 .map_err(|err| error!("Error getting account from BTP token: {:?}", err))
                 .and_then(
                     move |(_connection, account): (_, Option<AccountWithEncryptedTokens>)| {
@@ -927,9 +844,17 @@ impl BtpStore for RedisStore {
                                 if t == Bytes::from(token) {
                                     Ok(account)
                                 } else {
+                                    debug!(
+                                        "Found account {} but BTP auth token was wrong",
+                                        account.username
+                                    );
                                     Err(())
                                 }
                             } else {
+                                debug!(
+                                    "Account {} does not have an incoming btp token configured",
+                                    account.username
+                                );
                                 Err(())
                             }
                         } else {
@@ -948,19 +873,20 @@ impl BtpStore for RedisStore {
         Box::new(
             cmd("SMEMBERS")
                 .arg("btp_outgoing")
-                .query_async(self.connection.as_ref().clone())
+                .query_async(self.connection.clone())
                 .map_err(|err| error!("Error getting members of set btp_outgoing: {:?}", err))
                 .and_then(
-                    |(connection, account_ids): (SharedConnection, Vec<AccountId>)| {
+                    move |(connection, account_ids): (RedisReconnect, Vec<AccountId>)| {
                         if account_ids.is_empty() {
                             Either::A(ok(Vec::new()))
                         } else {
-                            let mut pipe = redis::pipe();
-                            for id in account_ids {
-                                pipe.hgetall(accounts_key(id));
+                            let mut script = LOAD_ACCOUNTS.prepare_invoke();
+                            for id in account_ids.iter() {
+                                script.arg(id.to_string());
                             }
                             Either::B(
-                                pipe.query_async(connection)
+                                script
+                                    .invoke_async(connection.clone())
                                     .map_err(|err| {
                                         error!(
                                         "Error getting accounts with outgoing BTP details: {:?}",
@@ -969,7 +895,7 @@ impl BtpStore for RedisStore {
                                     })
                                     .and_then(
                                         move |(_connection, accounts): (
-                                            SharedConnection,
+                                            RedisReconnect,
                                             Vec<AccountWithEncryptedTokens>,
                                         )| {
                                             let accounts: Vec<Account> = accounts
@@ -1007,7 +933,7 @@ impl HttpStore for RedisStore {
         Box::new(
             ACCOUNT_FROM_USERNAME
                 .arg(username.as_ref())
-                .invoke_async(self.connection.as_ref().clone())
+                .invoke_async(self.connection.clone())
                 .map_err(|err| error!("Error getting account from HTTP auth: {:?}", err))
                 .and_then(
                     move |(_connection, account): (_, Option<AccountWithEncryptedTokens>)| {
@@ -1034,7 +960,7 @@ impl HttpStore for RedisStore {
 }
 
 impl RouterStore for RedisStore {
-    fn routing_table(&self) -> HashMap<Bytes, <Self::Account as AccountTrait>::AccountId> {
+    fn routing_table(&self) -> Arc<HashMap<String, <Self::Account as AccountTrait>::AccountId>> {
         self.routes.read().clone()
     }
 }
@@ -1155,30 +1081,23 @@ impl NodeStore for RedisStore {
         let connection = self.connection.clone();
         pipe.smembers("accounts");
         Box::new(self.get_all_accounts_ids().and_then(move |account_ids| {
-            let mut pipe = redis::pipe();
-            for account_id in account_ids {
-                pipe.hgetall(accounts_key(account_id));
+            let mut script = LOAD_ACCOUNTS.prepare_invoke();
+            for id in account_ids.iter() {
+                script.arg(id.to_string());
             }
-
-            pipe.query_async(connection.as_ref().clone())
+            script
+                .invoke_async(connection.clone())
                 .map_err(|err| error!("Error getting account ids: {:?}", err))
-                .and_then(
-                    move |(_, accounts): (_, Vec<Option<AccountWithEncryptedTokens>>)| {
-                        let accounts: Vec<Account> = accounts
-                            .into_iter()
-                            .filter_map(|a| a)
-                            .map(|account| {
-                                account.decrypt_tokens(&decryption_key.expose_secret().0)
-                            })
-                            .collect();
-                        Ok(accounts)
-                    },
-                )
+                .and_then(move |(_, accounts): (_, Vec<AccountWithEncryptedTokens>)| {
+                    let accounts: Vec<Account> = accounts
+                        .into_iter()
+                        .map(|account| account.decrypt_tokens(&decryption_key.expose_secret().0))
+                        .collect();
+                    Ok(accounts)
+                })
         }))
     }
 
-    // TODO fix inconsistency betwen this method and set_routes which
-    // takes the prefixes as Bytes and the account as an Account object
     fn set_static_routes<R>(&self, routes: R) -> Box<dyn Future<Item = (), Error = ()> + Send>
     where
         R: IntoIterator<Item = (String, AccountId)>,
@@ -1192,9 +1111,9 @@ impl NodeStore for RedisStore {
         }
 
         let routing_table = self.routes.clone();
-        Box::new(pipe.query_async(self.connection.as_ref().clone())
+        Box::new(pipe.query_async(self.connection.clone())
             .map_err(|err| error!("Error checking if accounts exist while setting static routes: {:?}", err))
-            .and_then(|(connection, accounts_exist): (SharedConnection, Vec<bool>)| {
+            .and_then(|(connection, accounts_exist): (RedisReconnect, Vec<bool>)| {
                 if accounts_exist.iter().all(|a| *a) {
                     Ok(connection)
                 } else {
@@ -1211,7 +1130,7 @@ impl NodeStore for RedisStore {
             .ignore();
             pipe.query_async(connection)
                 .map_err(|err| error!("Error setting static routes: {:?}", err))
-                .and_then(move |(connection, _): (SharedConnection, Value)| {
+                .and_then(move |(connection, _): (RedisReconnect, Value)| {
                     update_routes(connection, routing_table)
                 })
             }))
@@ -1227,9 +1146,9 @@ impl NodeStore for RedisStore {
         Box::new(
         cmd("EXISTS")
             .arg(accounts_key(account_id))
-            .query_async(self.connection.as_ref().clone())
+            .query_async(self.connection.clone())
             .map_err(|err| error!("Error checking if account exists before setting static route: {:?}", err))
-            .and_then(move |(connection, exists): (SharedConnection, bool)| {
+            .and_then(move |(connection, exists): (RedisReconnect, bool)| {
                 if exists {
                     Ok(connection)
                 } else {
@@ -1244,10 +1163,97 @@ impl NodeStore for RedisStore {
                     .arg(account_id)
                     .query_async(connection)
                     .map_err(|err| error!("Error setting static route: {:?}", err))
-                    .and_then(move |(connection, _): (SharedConnection, Value)| {
+                    .and_then(move |(connection, _): (RedisReconnect, Value)| {
                         update_routes(connection, routing_table)
                     })
             })
+        )
+    }
+
+    fn set_default_route(
+        &self,
+        account_id: AccountId,
+    ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+        let routing_table = self.routes.clone();
+        // TODO replace this with a lua script to do both calls at once
+        Box::new(
+            cmd("EXISTS")
+                .arg(accounts_key(account_id))
+                .query_async(self.connection.clone())
+                .map_err(|err| {
+                    error!(
+                        "Error checking if account exists before setting default route: {:?}",
+                        err
+                    )
+                })
+                .and_then(move |(connection, exists): (RedisReconnect, bool)| {
+                    if exists {
+                        Ok(connection)
+                    } else {
+                        error!(
+                            "Cannot set default route because account {} does not exist",
+                            account_id
+                        );
+                        Err(())
+                    }
+                })
+                .and_then(move |connection| {
+                    cmd("SET")
+                        .arg(DEFAULT_ROUTE_KEY)
+                        .arg(account_id)
+                        .query_async(connection)
+                        .map_err(|err| error!("Error setting default route: {:?}", err))
+                        .and_then(move |(connection, _): (RedisReconnect, Value)| {
+                            debug!("Set default route to account id: {}", account_id);
+                            update_routes(connection, routing_table)
+                        })
+                }),
+        )
+    }
+
+    fn set_settlement_engines(
+        &self,
+        asset_to_url_map: impl IntoIterator<Item = (String, Url)>,
+    ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+        let asset_to_url_map: Vec<(String, String)> = asset_to_url_map
+            .into_iter()
+            .map(|(asset_code, url)| (asset_code, url.to_string()))
+            .collect();
+        debug!("Setting settlement engines to {:?}", asset_to_url_map);
+        Box::new(
+            cmd("HMSET")
+                .arg(SETTLEMENT_ENGINES_KEY)
+                .arg(asset_to_url_map)
+                .query_async(self.connection.clone())
+                .map_err(|err| error!("Error setting settlement engines: {:?}", err))
+                .and_then(|(_, _): (RedisReconnect, Value)| Ok(())),
+        )
+    }
+
+    fn get_asset_settlement_engine(
+        &self,
+        asset_code: &str,
+    ) -> Box<dyn Future<Item = Option<Url>, Error = ()> + Send> {
+        Box::new(
+            cmd("HGET")
+                .arg(SETTLEMENT_ENGINES_KEY)
+                .arg(asset_code)
+                .query_async(self.connection.clone())
+                .map_err(|err| error!("Error getting settlement engine: {:?}", err))
+                .map(|(_, url): (_, Option<String>)| {
+                    if let Some(url) = url {
+                        Url::parse(url.as_str())
+                            .map_err(|err| {
+                                error!(
+                                "Settlement engine URL loaded from Redis was not a valid URL: {:?}",
+                                err
+                            )
+                            })
+                            .ok()
+                    } else {
+                        None
+                    }
+                }),
         )
     }
 }
@@ -1259,20 +1265,22 @@ impl AddressStore for RedisStore {
         &self,
         ilp_address: Address,
     ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
-        let self_clone = self.clone();
+        debug!("Setting ILP address to: {}", ilp_address);
         let routing_table = self.routes.clone();
-        let conn = self.connection.clone();
+        let connection = self.connection.clone();
         let ilp_address_clone = ilp_address.clone();
+
+        // Set the ILP address we have in memory
+        (*self.ilp_address.write()) = ilp_address.clone();
+
+        // Save it to Redis
         Box::new(
             cmd("SET")
                 .arg(PARENT_ILP_KEY)
                 .arg(ilp_address.as_bytes())
-                .query_async(self.connection.as_ref().clone())
-                .map_err(|err| error!("Error setting static ilp address {:?}", err))
-                .and_then(move |(_, _): (SharedConnection, Value)| {
-                    *(self_clone.ilp_address.write()) = ilp_address;
-                    Ok(())
-                })
+                .query_async(self.connection.clone())
+                .map_err(|err| error!("Error setting ILP address {:?}", err))
+                .and_then(move |(_, _): (RedisReconnect, Value)| Ok(()))
                 .join(self.get_all_accounts().and_then(move |accounts| {
                     // TODO: This can be an expensive operation if this function
                     // gets called often. This currently only gets called when
@@ -1284,15 +1292,31 @@ impl AddressStore for RedisStore {
                     // on the store.
                     let mut pipe = redis::pipe();
                     for account in accounts {
-                        // Update the address and routes of all children.
-                        if account.routing_relation() == RoutingRelation::Child {
+                        // Update the address and routes of all children and non-routing accounts.
+                        if account.routing_relation() != RoutingRelation::Parent
+                            && account.routing_relation() != RoutingRelation::Peer
+                        {
                             // remove the old route
-                            pipe.hdel(ROUTES_KEY, account.ilp_address.as_bytes())
-                                .ignore();
+                            pipe.hdel(ROUTES_KEY, &account.ilp_address as &str).ignore();
 
-                            let new_ilp_address = ilp_address_clone
-                                .with_suffix(account.username().as_bytes())
-                                .unwrap();
+                            // if the username of the account ends with the
+                            // node's address, we're already configured so no
+                            // need to append anything.
+                            let ilp_address_clone2 = ilp_address_clone.clone();
+                            // Note: We are assuming that if the node's address
+                            // ends with the account's username, then this
+                            // account represents the node's non routing
+                            // account. Is this a reasonable assumption to make?
+                            let new_ilp_address =
+                                if ilp_address_clone2.segments().rev().next().unwrap()
+                                    == account.username().to_string()
+                                {
+                                    ilp_address_clone2
+                                } else {
+                                    ilp_address_clone
+                                        .with_suffix(account.username().as_bytes())
+                                        .unwrap()
+                                };
                             pipe.hset(
                                 accounts_key(account.id()),
                                 "ilp_address",
@@ -1304,9 +1328,9 @@ impl AddressStore for RedisStore {
                                 .ignore();
                         }
                     }
-                    pipe.query_async(conn.as_ref().clone())
+                    pipe.query_async(connection.clone())
                         .map_err(|err| error!("Error updating children: {:?}", err))
-                        .and_then(move |(connection, _): (SharedConnection, Value)| {
+                        .and_then(move |(connection, _): (RedisReconnect, Value)| {
                             update_routes(connection, routing_table)
                         })
                 }))
@@ -1319,9 +1343,9 @@ impl AddressStore for RedisStore {
         Box::new(
             cmd("DEL")
                 .arg(PARENT_ILP_KEY)
-                .query_async(self.connection.as_ref().clone())
+                .query_async(self.connection.clone())
                 .map_err(|err| error!("Error removing parent address: {:?}", err))
-                .and_then(move |(_, _): (SharedConnection, Value)| {
+                .and_then(move |(_, _): (RedisReconnect, Value)| {
                     *(self_clone.ilp_address.write()) = DEFAULT_ILP_ADDRESS.clone();
                     Ok(())
                 }),
@@ -1334,31 +1358,35 @@ impl AddressStore for RedisStore {
     }
 }
 
-type RoutingTable<A> = HashMap<Bytes, A>;
+type RoutingTable<A> = HashMap<String, A>;
 
 impl RouteManagerStore for RedisStore {
     type Account = Account;
 
     fn get_accounts_to_send_routes_to(
         &self,
+        ignore_accounts: Vec<AccountId>,
     ) -> Box<dyn Future<Item = Vec<Account>, Error = ()> + Send> {
         let decryption_key = self.decryption_key.clone();
         Box::new(
             cmd("SMEMBERS")
                 .arg("send_routes_to")
-                .query_async(self.connection.as_ref().clone())
+                .query_async(self.connection.clone())
                 .map_err(|err| error!("Error getting members of set send_routes_to: {:?}", err))
                 .and_then(
-                    |(connection, account_ids): (SharedConnection, Vec<AccountId>)| {
+                    move |(connection, account_ids): (RedisReconnect, Vec<AccountId>)| {
                         if account_ids.is_empty() {
                             Either::A(ok(Vec::new()))
                         } else {
-                            let mut pipe = redis::pipe();
-                            for id in account_ids {
-                                pipe.hgetall(accounts_key(id));
+                            let mut script = LOAD_ACCOUNTS.prepare_invoke();
+                            for id in account_ids.iter() {
+                                if !ignore_accounts.contains(id) {
+                                    script.arg(id.to_string());
+                                }
                             }
                             Either::B(
-                                pipe.query_async(connection)
+                                script
+                                    .invoke_async(connection.clone())
                                     .map_err(|err| {
                                         error!(
                                             "Error getting accounts to send routes to: {:?}",
@@ -1367,7 +1395,7 @@ impl RouteManagerStore for RedisStore {
                                     })
                                     .and_then(
                                         move |(_connection, accounts): (
-                                            SharedConnection,
+                                            RedisReconnect,
                                             Vec<AccountWithEncryptedTokens>,
                                         )| {
                                             let accounts: Vec<Account> = accounts
@@ -1395,7 +1423,7 @@ impl RouteManagerStore for RedisStore {
         Box::new(
             cmd("SMEMBERS")
                 .arg("receive_routes_from")
-                .query_async(self.connection.as_ref().clone())
+                .query_async(self.connection.clone())
                 .map_err(|err| {
                     error!(
                         "Error getting members of set receive_routes_from: {:?}",
@@ -1403,16 +1431,17 @@ impl RouteManagerStore for RedisStore {
                     )
                 })
                 .and_then(
-                    |(connection, account_ids): (SharedConnection, Vec<AccountId>)| {
+                    |(connection, account_ids): (RedisReconnect, Vec<AccountId>)| {
                         if account_ids.is_empty() {
                             Either::A(ok(Vec::new()))
                         } else {
-                            let mut pipe = redis::pipe();
-                            for id in account_ids {
-                                pipe.hgetall(accounts_key(id));
+                            let mut script = LOAD_ACCOUNTS.prepare_invoke();
+                            for id in account_ids.iter() {
+                                script.arg(id.to_string());
                             }
                             Either::B(
-                                pipe.query_async(connection)
+                                script
+                                    .invoke_async(connection.clone())
                                     .map_err(|err| {
                                         error!(
                                             "Error getting accounts to receive routes from: {:?}",
@@ -1421,7 +1450,7 @@ impl RouteManagerStore for RedisStore {
                                     })
                                     .and_then(
                                         move |(_connection, accounts): (
-                                            SharedConnection,
+                                            RedisReconnect,
                                             Vec<AccountWithEncryptedTokens>,
                                         )| {
                                             let accounts: Vec<Account> = accounts
@@ -1448,26 +1477,24 @@ impl RouteManagerStore for RedisStore {
     {
         let get_static_routes = cmd("HGETALL")
             .arg(STATIC_ROUTES_KEY)
-            .query_async(self.connection.as_ref().clone())
+            .query_async(self.connection.clone())
             .map_err(|err| error!("Error getting static routes: {:?}", err))
             .and_then(
-                |(_, static_routes): (SharedConnection, Vec<(String, AccountId)>)| {
-                    Ok(static_routes)
-                },
+                |(_, static_routes): (RedisReconnect, Vec<(String, AccountId)>)| Ok(static_routes),
             );
         Box::new(self.get_all_accounts().join(get_static_routes).and_then(
             |(accounts, static_routes)| {
                 let local_table = HashMap::from_iter(
                     accounts
                         .iter()
-                        .map(|account| (account.ilp_address.to_bytes(), account.clone())),
+                        .map(|account| (account.ilp_address.to_string(), account.clone())),
                 );
 
                 let account_map: HashMap<AccountId, &Account> = HashMap::from_iter(accounts.iter().map(|account| (account.id, account)));
-                let configured_table: HashMap<Bytes, Account> = HashMap::from_iter(static_routes.into_iter()
+                let configured_table: HashMap<String, Account> = HashMap::from_iter(static_routes.into_iter()
                     .filter_map(|(prefix, account_id)| {
                         if let Some(account) = account_map.get(&account_id) {
-                            Some((Bytes::from(prefix), (*account).clone()))
+                            Some((prefix, (*account).clone()))
                         } else {
                             warn!("No account for ID: {}, ignoring configured route for prefix: {}", account_id, prefix);
                             None
@@ -1481,17 +1508,11 @@ impl RouteManagerStore for RedisStore {
 
     fn set_routes(
         &mut self,
-        routes: impl IntoIterator<Item = (Bytes, Account)>,
+        routes: impl IntoIterator<Item = (String, Account)>,
     ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
         let routes: Vec<(String, AccountId)> = routes
             .into_iter()
-            .filter_map(|(prefix, account)| {
-                if let Ok(prefix) = String::from_utf8(prefix.to_vec()) {
-                    Some((prefix, account.id))
-                } else {
-                    None
-                }
-            })
+            .map(|(prefix, account)| (prefix, account.id))
             .collect();
         let num_routes = routes.len();
 
@@ -1504,9 +1525,9 @@ impl RouteManagerStore for RedisStore {
             .hset_multiple(ROUTES_KEY, &routes)
             .ignore();
         Box::new(
-            pipe.query_async(self.connection.as_ref().clone())
+            pipe.query_async(self.connection.clone())
                 .map_err(|err| error!("Error setting routes: {:?}", err))
-                .and_then(move |(connection, _): (SharedConnection, Value)| {
+                .and_then(move |(connection, _): (RedisReconnect, Value)| {
                     trace!("Saved {} routes to Redis", num_routes);
                     update_routes(connection, routing_tale)
                 }),
@@ -1551,7 +1572,7 @@ impl RateLimitStore for RedisStore {
                     .arg(prepare_amount);
             }
             Box::new(
-                pipe.query_async(self.connection.as_ref().clone())
+                pipe.query_async(self.connection.clone())
                     .map_err(|err| {
                         error!("Error applying rate limits: {:?}", err);
                         RateLimitError::StoreError
@@ -1594,7 +1615,7 @@ impl RateLimitStore for RedisStore {
                     .arg(60)
                     // TODO make sure this doesn't overflow
                     .arg(0i64 - (prepare_amount as i64))
-                    .query_async(self.connection.as_ref().clone())
+                    .query_async(self.connection.clone())
                     .map_err(|err| error!("Error refunding throughput limit: {:?}", err))
                     .and_then(|(_, _): (_, Value)| Ok(())),
             )
@@ -1613,7 +1634,7 @@ impl IdempotentStore for RedisStore {
         Box::new(
             cmd("HGETALL")
                 .arg(prefixed_idempotency_key(idempotency_key.clone()))
-                .query_async(self.connection.as_ref().clone())
+                .query_async(self.connection.clone())
                 .map_err(move |err| {
                     error!(
                         "Error loading idempotency key {}: {:?}",
@@ -1629,7 +1650,7 @@ impl IdempotentStore for RedisStore {
                         trace!("Loaded idempotency key {:?} - {:?}", idempotency_key, ret);
                         let mut input_hash: [u8; 32] = Default::default();
                         input_hash.copy_from_slice(input_hash_slice.as_ref());
-                        Ok(Some((
+                        Ok(Some(IdempotentData::new(
                             StatusCode::from_str(status_code).unwrap(),
                             Bytes::from(data.clone()),
                             input_hash,
@@ -1662,7 +1683,7 @@ impl IdempotentStore for RedisStore {
             .expire(&prefixed_idempotency_key(idempotency_key.clone()), 86400)
             .ignore();
         Box::new(
-            pipe.query_async(self.connection.as_ref().clone())
+            pipe.query_async(self.connection.clone())
                 .map_err(|err| error!("Error caching: {:?}", err))
                 .and_then(move |(_connection, _): (_, Vec<String>)| {
                     trace!(
@@ -1692,7 +1713,7 @@ impl SettlementStore for RedisStore {
             .arg(account_id)
             .arg(amount)
             .arg(idempotency_key)
-            .invoke_async(self.connection.as_ref().clone())
+            .invoke_async(self.connection.clone())
             .map_err(move |err| error!("Error processing incoming settlement from account: {} for amount: {}: {:?}", account_id, amount, err))
             .and_then(move |(_connection, balance): (_, i64)| {
                 trace!("Processed incoming settlement from account: {} for amount: {}. Balance is now: {}", account_id, amount, balance);
@@ -1714,7 +1735,7 @@ impl SettlementStore for RedisStore {
             REFUND_SETTLEMENT
                 .arg(account_id)
                 .arg(settle_amount)
-                .invoke_async(self.connection.as_ref().clone())
+                .invoke_async(self.connection.clone())
                 .map_err(move |err| {
                     error!(
                         "Error refunding settlement for account: {} of amount: {}: {:?}",
@@ -1734,34 +1755,222 @@ impl SettlementStore for RedisStore {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AmountWithScale {
+    num: BigUint,
+    scale: u8,
+}
+
+impl ToRedisArgs for AmountWithScale {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + RedisWrite,
+    {
+        let mut rv = Vec::new();
+        self.num.to_string().write_redis_args(&mut rv);
+        self.scale.to_string().write_redis_args(&mut rv);
+        ToRedisArgs::make_arg_vec(&rv, out);
+    }
+}
+
+impl AmountWithScale {
+    fn parse_multi_values(items: &[Value]) -> Option<Self> {
+        // We have to iterate over all values because in this case we're making
+        // an lrange call. This returns all the tuple elements in 1 array, and
+        // it cannot differentiate between 1 AmountWithScale value or multiple
+        // ones. This looks like a limitation of redis.rs
+        let len = items.len();
+        let mut iter = items.iter();
+
+        let mut max_scale = 0;
+        let mut amounts = Vec::new();
+        // if redis.rs could parse this properly, we could remove this loop,
+        // take 2 elements from the items iterator and return. Then we'd perform
+        // the summation and scaling in the consumer of the returned vector.
+        for _ in (0..len).step_by(2) {
+            let num: String = match iter.next().map(FromRedisValue::from_redis_value) {
+                Some(Ok(n)) => n,
+                _ => return None,
+            };
+            let num = match BigUint::from_str(&num) {
+                Ok(a) => a,
+                Err(_) => return None,
+            };
+
+            let scale: u8 = match iter.next().map(FromRedisValue::from_redis_value) {
+                Some(Ok(c)) => c,
+                _ => return None,
+            };
+
+            if scale > max_scale {
+                max_scale = scale;
+            }
+            amounts.push((num, scale));
+        }
+
+        // We must scale them to the largest scale, and then add them together
+        let mut sum = BigUint::from(0u32);
+        for amount in &amounts {
+            sum += amount
+                .0
+                .normalize_scale(ConvertDetails {
+                    from: amount.1,
+                    to: max_scale,
+                })
+                .unwrap();
+        }
+
+        Some(AmountWithScale {
+            num: sum,
+            scale: max_scale,
+        })
+    }
+}
+
+impl FromRedisValue for AmountWithScale {
+    fn from_redis_value(v: &Value) -> Result<Self, RedisError> {
+        if let Value::Bulk(ref items) = *v {
+            if let Some(result) = Self::parse_multi_values(items) {
+                return Ok(result);
+            }
+        }
+        Err(RedisError::from((
+            ErrorKind::TypeError,
+            "Cannot parse amount with scale",
+        )))
+    }
+}
+
+impl LeftoversStore for RedisStore {
+    type AccountId = AccountId;
+    type AssetType = BigUint;
+
+    fn get_uncredited_settlement_amount(
+        &self,
+        account_id: Self::AccountId,
+    ) -> Box<dyn Future<Item = (Self::AssetType, u8), Error = ()> + Send> {
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        // get the amounts and instantly delete them
+        pipe.lrange(uncredited_amount_key(account_id.to_string()), 0, -1);
+        pipe.del(uncredited_amount_key(account_id.to_string()))
+            .ignore();
+        Box::new(
+            pipe.query_async(self.connection.clone())
+                .map_err(move |err| error!("Error getting uncredited_settlement_amount {:?}", err))
+                .and_then(move |(_, amounts): (_, Vec<AmountWithScale>)| {
+                    // this call will only return 1 element
+                    let amount = amounts[0].clone();
+                    Ok((amount.num, amount.scale))
+                }),
+        )
+    }
+
+    fn save_uncredited_settlement_amount(
+        &self,
+        account_id: Self::AccountId,
+        uncredited_settlement_amount: (Self::AssetType, u8),
+    ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+        trace!(
+            "Saving uncredited_settlement_amount {:?} {:?}",
+            account_id,
+            uncredited_settlement_amount
+        );
+        Box::new(
+            // We store these amounts as lists of strings
+            // because we cannot do BigNumber arithmetic in the store
+            // When loading the amounts, we convert them to the appropriate data
+            // type and sum them up.
+            cmd("RPUSH")
+                .arg(uncredited_amount_key(account_id))
+                .arg(AmountWithScale {
+                    num: uncredited_settlement_amount.0,
+                    scale: uncredited_settlement_amount.1,
+                })
+                .query_async(self.connection.clone())
+                .map_err(move |err| error!("Error saving uncredited_settlement_amount: {:?}", err))
+                .and_then(move |(_conn, _ret): (_, Value)| Ok(())),
+        )
+    }
+
+    fn load_uncredited_settlement_amount(
+        &self,
+        account_id: Self::AccountId,
+        local_scale: u8,
+    ) -> Box<dyn Future<Item = Self::AssetType, Error = ()> + Send> {
+        let connection = self.connection.clone();
+        trace!("Loading uncredited_settlement_amount {:?}", account_id);
+        Box::new(
+            self.get_uncredited_settlement_amount(account_id)
+                .and_then(move |amount| {
+                    // scale the amount from the max scale to the local scale, and then
+                    // save any potential leftovers to the store
+                    let (scaled_amount, precision_loss) =
+                        scale_with_precision_loss(amount.0, local_scale, amount.1);
+                    if precision_loss > BigUint::from(0u32) {
+                        Either::A(
+                            cmd("RPUSH")
+                                .arg(uncredited_amount_key(account_id))
+                                .arg(AmountWithScale {
+                                    num: precision_loss,
+                                    scale: std::cmp::max(local_scale, amount.1),
+                                })
+                                .query_async(connection.clone())
+                                .map_err(move |err| {
+                                    error!("Error saving uncredited_settlement_amount: {:?}", err)
+                                })
+                                .and_then(move |(_conn, _ret): (_, Value)| Ok(scaled_amount)),
+                        )
+                    } else {
+                        Either::B(ok(scaled_amount))
+                    }
+                }),
+        )
+    }
+}
+
 type RouteVec = Vec<(String, AccountId)>;
 
 // TODO replace this with pubsub when async pubsub is added upstream: https://github.com/mitsuhiko/redis-rs/issues/183
 fn update_routes(
-    connection: SharedConnection,
-    routing_table: Arc<RwLock<HashMap<Bytes, AccountId>>>,
+    connection: RedisReconnect,
+    routing_table: Arc<RwLock<Arc<HashMap<String, AccountId>>>>,
 ) -> impl Future<Item = (), Error = ()> {
     let mut pipe = redis::pipe();
-    pipe.hgetall(ROUTES_KEY).hgetall(STATIC_ROUTES_KEY);
+    pipe.hgetall(ROUTES_KEY)
+        .hgetall(STATIC_ROUTES_KEY)
+        .get(DEFAULT_ROUTE_KEY);
     pipe.query_async(connection)
         .map_err(|err| error!("Error polling for routing table updates: {:?}", err))
         .and_then(
-            move |(_connection, (routes, static_routes)): (_, (RouteVec, RouteVec))| {
+            move |(_connection, (routes, static_routes, default_route)): (
+                _,
+                (RouteVec, RouteVec, Option<AccountId>),
+            )| {
                 trace!(
-                    "Loaded routes from redis. Static routes: {:?}, other routes: {:?}",
+                    "Loaded routes from redis. Static routes: {:?}, default route: {:?}, other routes: {:?}",
                     static_routes,
+                    default_route,
                     routes
                 );
+                // If there is a default route set in the db,
+                // set the entry for "" in the routing table to route to that account
+                let default_route_iter = iter::once(default_route)
+                    .filter_map(|r| r)
+                    .map(|account_id| (String::new(), account_id));
                 let routes = HashMap::from_iter(
                     routes
                         .into_iter()
+                        // Include the default route if there is one
+                        .chain(default_route_iter)
                         // Having the static_routes inserted after ensures that they will overwrite
                         // any routes with the same prefix from the first set
                         .chain(static_routes.into_iter())
-                        .map(|(prefix, account_id)| (Bytes::from(prefix), account_id)),
                 );
+                // TODO we may not want to print this because the routing table will be very big
+                // if the node has a lot of local accounts
                 trace!("Routing table is: {:?}", routes);
-                *routing_table.write() = routes;
+                *routing_table.write() = Arc::new(routes);
                 Ok(())
             },
         )

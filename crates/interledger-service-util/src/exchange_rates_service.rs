@@ -3,7 +3,7 @@ use futures::{
     future::{err, Either},
     Future, Stream,
 };
-use interledger_packet::{Address, ErrorCode, Fulfill, Reject, RejectBuilder};
+use interledger_packet::{ErrorCode, Fulfill, Reject, RejectBuilder};
 use interledger_service::*;
 // TODO remove the dependency on interledger_settlement, that doesn't really make sense for this minor import
 use interledger_settlement::{Convert, ConvertDetails};
@@ -14,6 +14,10 @@ use serde::Deserialize;
 use std::{
     collections::HashMap,
     marker::PhantomData,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::{executor::spawn, timer::Interval};
@@ -42,7 +46,6 @@ pub trait ExchangeRateStore: Clone {
 /// Requires a `ExchangeRateStore`
 #[derive(Clone)]
 pub struct ExchangeRateService<S, O, A> {
-    ilp_address: Address,
     spread: f64,
     store: S,
     next: O,
@@ -51,13 +54,12 @@ pub struct ExchangeRateService<S, O, A> {
 
 impl<S, O, A> ExchangeRateService<S, O, A>
 where
-    S: ExchangeRateStore,
+    S: AddressStore + ExchangeRateStore,
     O: OutgoingService<A>,
     A: Account,
 {
-    pub fn new(ilp_address: Address, spread: f64, store: S, next: O) -> Self {
+    pub fn new(spread: f64, store: S, next: O) -> Self {
         ExchangeRateService {
-            ilp_address,
             spread,
             store,
             next,
@@ -69,7 +71,7 @@ where
 impl<S, O, A> OutgoingService<A> for ExchangeRateService<S, O, A>
 where
     // TODO can we make these non-'static?
-    S: ExchangeRateStore + Clone + Send + Sync + 'static,
+    S: AddressStore + ExchangeRateStore + Clone + Send + Sync + 'static,
     O: OutgoingService<A> + Send + Clone + 'static,
     A: Account + Sync + 'static,
 {
@@ -85,6 +87,7 @@ where
         &mut self,
         mut request: OutgoingRequest<A>,
     ) -> Box<dyn Future<Item = Fulfill, Error = Reject> + Send> {
+        let ilp_address = self.store.get_ilp_address();
         if request.prepare.amount() > 0 {
             let rate: f64 = if request.from.asset_code() == request.to.asset_code() {
                 1f64
@@ -92,7 +95,11 @@ where
                 .store
                 .get_exchange_rates(&[&request.from.asset_code(), &request.to.asset_code()])
             {
-                rates[1] / rates[0]
+                // Exchange rates are expressed as `base asset / asset`. To calculate the outgoing amount,
+                // we multiply by the incoming asset's rate and divide by the outgoing asset's rate. For example,
+                // if an incoming packet is denominated in an asset worth 1 USD and the outgoing asset is worth
+                // 10 USD, the outgoing amount will be 1/10th of the source amount.
+                rates[0] / rates[1]
             } else {
                 error!(
                     "No exchange rates available for assets: {}, {}",
@@ -100,19 +107,14 @@ where
                     request.to.asset_code()
                 );
                 return Box::new(err(RejectBuilder {
-                    // Unreachable doesn't seem to be the correct code here.
-                    // If the pair was not found, shouldn't we have a unique error code
-                    // for that such as `ErrorCode::F10_PAIRNOTFOUND` ?
-                    // Timeout should still apply we if we add a timeout
-                    // error in the get_exchange_rate call
-                    code: ErrorCode::F02_UNREACHABLE,
+                    code: ErrorCode::T00_INTERNAL_ERROR,
                     message: format!(
                         "No exchange rate available from asset: {} to: {}",
                         request.from.asset_code(),
                         request.to.asset_code()
                     )
                     .as_bytes(),
-                    triggered_by: Some(&self.ilp_address),
+                    triggered_by: Some(&ilp_address),
                     data: &[],
                 }
                 .build()));
@@ -151,7 +153,7 @@ where
                                 outgoing_amount,
                             )
                             .as_bytes(),
-                            triggered_by: Some(&self.ilp_address),
+                            triggered_by: Some(&ilp_address),
                             data: &[],
                         }
                         .build()));
@@ -177,7 +179,7 @@ where
                             request.prepare.amount(),
                         )
                         .as_bytes(),
-                        triggered_by: Some(&self.ilp_address),
+                        triggered_by: Some(&ilp_address),
                         data: &[],
                     }
                     .build()));
@@ -189,17 +191,38 @@ where
     }
 }
 
+/// This determines which external API service to poll for exchange rates.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ExchangeRateProvider {
+    /// Use the [CoinCap] API.
+    ///
+    /// Note that when configured with YAML, this MUST be specified as
+    /// "CoinCap", not "coin_cap".
+    ///
+    /// [CoinCap]: https://coincap.io/
+    #[serde(alias = "coin_cap", alias = "coincap", alias = "Coincap")]
     CoinCap,
-    /// CryptoCompare must be configured with an API key
+    /// Use the [CryptoCompare] API. Note this service requires an
+    /// API key (but the free tier supports 100,000 requests / month at the
+    /// time of writing).
+    ///
+    /// Note that when configured with YAML, this MUST be specified as
+    /// "CryptoCompare", not "crypto_compare".
+    ///
+    /// [CryptoCompare]: https://cryptocompare.com
+    #[serde(
+        alias = "crypto_compare",
+        alias = "cryptocompare",
+        alias = "Cryptocompare"
+    )]
     CryptoCompare(SecretString),
 }
 
 /// Poll exchange rate providers for the current exchange rates
 pub struct ExchangeRateFetcher<S> {
     provider: ExchangeRateProvider,
+    consecutive_failed_polls: Arc<AtomicU32>,
+    failed_polls_before_invalidation: u32,
     store: S,
     client: Client,
 }
@@ -208,15 +231,25 @@ impl<S> ExchangeRateFetcher<S>
 where
     S: ExchangeRateStore + Send + Sync + 'static,
 {
-    pub fn new(provider: ExchangeRateProvider, store: S) -> Self {
+    pub fn new(
+        provider: ExchangeRateProvider,
+        failed_polls_before_invalidation: u32,
+        store: S,
+    ) -> Self {
         ExchangeRateFetcher {
             provider,
+            consecutive_failed_polls: Arc::new(AtomicU32::new(0)),
+            failed_polls_before_invalidation,
             store,
             client: Client::new(),
         }
     }
 
     pub fn fetch_on_interval(self, interval: Duration) -> impl Future<Item = (), Error = ()> {
+        debug!(
+            "Starting interval to poll exchange rate provider: {:?} for rates",
+            self.provider
+        );
         Interval::new(Instant::now(), interval)
             .map_err(|err| {
                 error!(
@@ -246,18 +279,26 @@ where
     }
 
     fn update_rates(&self) -> impl Future<Item = (), Error = ()> {
+        let consecutive_failed_polls = self.consecutive_failed_polls.clone();
+        let consecutive_failed_polls_zeroer = consecutive_failed_polls.clone();
+        let failed_polls_before_invalidation = self.failed_polls_before_invalidation;
         let store = self.store.clone();
         let store_clone = self.store.clone();
         let provider = self.provider.clone();
         self.fetch_rates()
             .map_err(move |_| {
-                // TODO this is very aggressive that a single polling failure will cause it
-                // to wipe the old rates. We may want to make it slightly less aggressive
-                // (though it's tricky because operating with old rates is potentially very dangerous)
-                error!("Error updating exchange rates, removing old rates for safety");
-                // Clear out all of the old rates
-                if store.set_exchange_rates(HashMap::new()).is_err() {
-                    error!("Unable to update exchange rates in the store");
+                // Note that a race between the read on this line and the check on the line after
+                // is quite unlikely as long as the interval between polls is reasonable.
+                let failed_polls = consecutive_failed_polls.fetch_add(1, Ordering::Relaxed);
+                if failed_polls < failed_polls_before_invalidation {
+                    warn!("Failed to update exchange rates (previous consecutive failed attempts: {})", failed_polls);
+                } else {
+                    error!("Failed to update exchange rates (previous consecutive failed attempts: {}), removing old rates for safety", failed_polls);
+                    // Clear out all of the old rates
+                    if store.set_exchange_rates(HashMap::new()).is_err() {
+                        error!("Failed to clear exchange rates cache after exchange rates server became unresponsive; panicking");
+                        panic!("Failed to clear exchange rates cache after exchange rates server became unresponsive");
+                    }
                 }
             })
             .and_then(move |mut rates| {
@@ -265,6 +306,8 @@ where
                 let num_rates = rates.len();
                 rates.insert("USD".to_string(), 1.0);
                 if store_clone.set_exchange_rates(rates).is_ok() {
+                    // Reset our invalidation counter
+                    consecutive_failed_polls_zeroer.store(0, Ordering::Relaxed);
                     debug!("Updated {} exchange rates from {:?}", num_rates, provider);
                     Ok(())
                 } else {
@@ -295,23 +338,25 @@ mod tests {
 
     #[test]
     fn exchange_rate_ok() {
-        let ret = exchange_rate(100, 1, 1.0, 1, 2.0, 0.0);
-        assert_eq!(ret.1[0].prepare.amount(), 200);
+        // if `to` is worth $2, and `from` is worth 1, then they receive half
+        // the amount of units
+        let ret = exchange_rate(200, 1, 1.0, 1, 2.0, 0.0);
+        assert_eq!(ret.1[0].prepare.amount(), 100);
 
         let ret = exchange_rate(1_000_000, 1, 3.0, 1, 2.0, 0.0);
-        assert_eq!(ret.1[0].prepare.amount(), 666_666);
+        assert_eq!(ret.1[0].prepare.amount(), 1_500_000);
     }
 
     #[test]
     fn exchange_conversion_error() {
         // rejects f64 that does not fit in u64
-        let ret = exchange_rate(std::u64::MAX, 1, 1.0, 1, 2.0, 0.0);
+        let ret = exchange_rate(std::u64::MAX, 1, 2.0, 1, 1.0, 0.0);
         let reject = ret.0.unwrap_err();
         assert_eq!(reject.code(), ErrorCode::F08_AMOUNT_TOO_LARGE);
         assert!(reject.message().starts_with(b"Could not cast"));
 
         // `Convert` errored
-        let ret = exchange_rate(std::u64::MAX, 1, 1.0, 255, std::f64::MAX, 0.0);
+        let ret = exchange_rate(std::u64::MAX, 1, std::f64::MAX, 255, 1.0, 0.0);
         let reject = ret.0.unwrap_err();
         assert_eq!(reject.code(), ErrorCode::F08_AMOUNT_TOO_LARGE);
         assert!(reject.message().starts_with(b"Could not convert"));
@@ -320,14 +365,15 @@ mod tests {
     #[test]
     fn applies_spread() {
         let ret = exchange_rate(100, 1, 1.0, 1, 2.0, 0.01);
-        assert_eq!(ret.1[0].prepare.amount(), 198);
+        assert_eq!(ret.1[0].prepare.amount(), 49);
 
         // Negative spread is unusual but possible
-        let ret = exchange_rate(100, 1, 1.0, 1, 2.0, -0.01);
-        assert_eq!(ret.1[0].prepare.amount(), 202);
+        let ret = exchange_rate(200, 1, 1.0, 1, 2.0, -0.01);
+        assert_eq!(ret.1[0].prepare.amount(), 101);
 
         // Rounds down
-        let ret = exchange_rate(1, 1, 1.0, 1, 2.0, 0.01);
+        let ret = exchange_rate(4, 1, 1.0, 1, 2.0, 0.01);
+        // this would've been 2, but it becomes 1.99 and gets rounded down to 1
         assert_eq!(ret.1[0].prepare.amount(), 1);
 
         // Spread >= 1 means the node takes everything
@@ -393,6 +439,25 @@ mod tests {
                 asset_code,
                 asset_scale,
             }
+        }
+    }
+
+    impl AddressStore for TestStore {
+        /// Saves the ILP Address in the store's memory and database
+        fn set_ilp_address(
+            &self,
+            _ilp_address: Address,
+        ) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+            unimplemented!()
+        }
+
+        fn clear_ilp_address(&self) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+            unimplemented!()
+        }
+
+        /// Get's the store's ilp address from memory
+        fn get_ilp_address(&self) -> Address {
+            Address::from_str("example.connector").unwrap()
         }
     }
 
@@ -465,11 +530,6 @@ mod tests {
         TestAccount,
     > {
         let store = test_store(rate1, rate2);
-        ExchangeRateService::new(
-            Address::from_str("example.bob").unwrap(),
-            spread,
-            store,
-            handler,
-        )
+        ExchangeRateService::new(spread, store, handler)
     }
 }
